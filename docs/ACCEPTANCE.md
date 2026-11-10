@@ -376,7 +376,7 @@ build exit=0
 | 项 | 内容 |
 |---|---|
 | 归属 | backend-core（引擎）+ watch 插件 + frontend（面板） |
-| 状态 | 引擎、工具与面板均已交付（`watch.vue` 已通过浏览器验证）；**R10.2 面板验收项待执行** |
+| 状态 | 引擎、工具与面板均已交付；**R10.2 PASS（2026-11-10 手工执行）** |
 | Given | `~/.guanlan/watches/` 可写；引擎已随插件启动（Tick 30 秒，仅交易时段求值） |
 | When | 创建规则 → 试运行 → 开关 → 看触发日志 → 改规则文件验证热加载 → 在面板里做同样四件事 |
 | Then | 规则文件生成且可列出；试运行只求值不触发；toggle 立即生效；日志可查；改文件 30 秒内生效；面板可打开并对同一批规则完成开关与试运行 |
@@ -395,7 +395,9 @@ go run . --headless --task=watch-test -- <规则ID>
 - `watches`：`{"rules": [...], "logs": [...], "metrics": [22 条], "running": true}`；
 - `watch-test`：`{"ruleId", "matched", "scenarios": [{"code"|"sector", "metrics", "matched"}], "summary", "prompt", "elapsedMs"}`，且**不产生新的触发日志**。
 
-### R10.2 面板（正式验收项，已可执行）
+### R10.2 面板（正式验收项，PASS 2026-11-10 手工执行）
+
+**证据**：`watch 面板：规则列表/开关可逆/试运行(scenarios+prompt)/日志无新增`
 
 | 步骤 | 期望 |
 |---|---|
@@ -423,7 +425,7 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 - 冷却期（`cooldownSeconds`）内重复触发，或单小时触发超过 6 次；
 - 面板打开即「面板组件缺失」、开关不写入 `enabled`、试运行页面与 `watch-test` 结果不一致。
 
-判 BLOCKED 的条件：`--task=plugins` 里没有 `watch`（插件未激活）。面板已交付，R10.2 可直接执行；尚未执行时记「待执行」，不记 FAIL。
+判 BLOCKED 的条件：`--task=plugins` 里没有 `watch`（插件未激活）。R10.2 已于 2026-11-10 手工执行并 PASS；后续回归时按上表七步重跑，任一条不满足即记 FAIL。
 
 
 ---
@@ -480,7 +482,7 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 | R7 自选同步 | 通过 | 20 组 163 只，`source=ths-local` |
 | R8 面板 | 通过 | 8 个面板均在桌面端验证；`watch` 面板浏览器验证通过（规则列表/开关/编辑器/指标 chips/一句话创建/触发日志） |
 | R9 安全 | 通过 | 脱敏、白名单、路径、审计均通过；工具索引无 `exec` |
-| R10 自定义 Watchdog | 引擎、工具、面板均已交付；R10.2 待执行 | 5 个 `watchdog.*` 工具齐备；规则热加载、试运行、日志、限流有单测；`watch.vue` 已交付并通过浏览器验证 |
+| R10 自定义 Watchdog | 通过（面板 PASS，2026-11-10 手工执行） | 5 个 `watchdog.*` 工具齐备；规则热加载、试运行、日志、限流有单测；watch 面板：规则列表/开关可逆/试运行(scenarios+prompt)/日志无新增 |
 
 ### A.4 交付时不计为失败的已知限制
 
@@ -520,7 +522,7 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 | R1 | PASS | test ! -d cmd/mini | PASS: 无 cmd/mini |
 | R2 | PASS | go test ./internal/kernel/ | ok 0.2xx s |
 | R3 | PASS | go run . --headless --task=quote -- 600000 | code=600000、price>0、source 非空 |
-| R10 | 待执行 | go run . --headless --task=watches | rules/logs/metrics 结构正确；面板步骤待跑 |
+| R10 | PASS | go run . --headless --task=watches + 面板手工七步 | rules/logs/metrics 结构正确；面板：规则列表/开关可逆/试运行(scenarios+prompt)/日志无新增 |
 ...
 汇总：PASS n / FAIL n / BLOCKED n（按实际填，不写「部分通过」）
 ```

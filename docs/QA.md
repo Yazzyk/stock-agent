@@ -1,7 +1,7 @@
 # 质量与验收报告（QA）
 
 维护：qa · 判定标准来源：`docs/ACCEPTANCE.md`（R1–R9）、`docs/PLAN.md`（所有权/红线）、`docs/DOMAIN.md`（口径）
-最近更新：2026-11-10 22:55（Asia/Shanghai）· 状态：**终态验收 R1–R10（PASS 9 / FAIL 0 / BLOCKED 1，BLOCKED 仅因 QA 环境无 API Key）**
+最近更新：2026-11-10 23:10（Asia/Shanghai）· 状态：**终态验收 R1–R10（含 R10.1 自动化 / R10.2 面板手工）：PASS 9 / FAIL 0 / BLOCKED 1，BLOCKED 仅因 QA 环境无 API Key**
 
 > 只记录实测。三态沿用 ACCEPTANCE §0：PASS / FAIL / BLOCKED，不写"部分通过"。
 > 所有命令都在仓库根目录执行；`~/.guanlan` 是真实数据目录，QA 的 live 测试用**临时目录**跑，不污染它。
@@ -49,9 +49,11 @@
 | R8 资金流与 K 线面板 | backend-data + frontend | **PASS** | `--task=flow.rank`；`--task=sector.list`；`cd frontend && npm run build` | flow.rank：电子 主力净额 `9201537792`（元，9.2e9 落在 1e7–1e11 区间 ✓）；sector.list：100 条含 changePct/mainNet；前端 `vue-tsc --noEmit && vite build` PASS（verify.sh 实测约 2s） |
 | R9 安全与一键验收 | lead + qa | **PASS** | `selftest | grep -E "sk-|Bearer |token="`；`tools | grep -c "\[exec\]"`；`verify.sh`；`go test -race ./...` | 密钥特征 **0**；exec 工具 **0**；`verify.sh --with-network --with-race` **10/10 PASS**；`-race` 18 个包全绿无 DATA RACE；落盘仅在 `~/.guanlan`（DB/审计/会话/知识库）；`wails build -clean` 由 lead 跑通（build/bin/guanlan.app） |
 
-| R10 Watch 哨兵（第 8 插件） | backend-core + qa | **PASS** | `--task=watches`；`--task=watch-test -- <id>`；`go test ./test/ -run TestWatch` | ① **规则可创建/可开关**：方法链路 save→toggle(true)→toggle(false)→remove 全通，规则文件落 `<DataDir>/watches/<id>.json` 且删除时同步清理；② **试运行返回 metrics 且 matched 与条件一致**：条件 `quote.price > 10`（fake 现价 10.2）→ matched=true、metrics 含 `quote.price=10.2`；把条件改成 `> 100` → matched=false；headless 实测 `--task=watch-test -- w68aaf120f8f8` matched=true，metrics `sector.mainNet=4062413312`/`sector.changePct=2.97`；③ **文件改动 5s 内生效**：引擎 Tick=100ms 下改 `watches/*.json`，5s 内 `Get` 看到新 condition（实测 0.2s）；④ **DSL 无法执行代码**：`exec("rm -rf /")`、`os.system("rm")`、`import os`、`quote["price"]`、`eval(1)`、`quote.price > 1; rm -rf /`、反引号与 `__import__` 共 10 种写法全部解析失败，`Rule.Validate` 拒绝非白名单指标（`quote.foo`/`quote.constructor`/`window.location`/`process.env`）；⑤ **装配契约**：缺 `agent.runtime` 时 watch 激活失败且错误指向该服务与 agentlab；⑥ **默认关闭**：新建不传 `enabled` → false，tick 500ms 内零触发；显式 toggle 后才触发（RunLog triggered+matched） |
+| R10.1 Watch 哨兵后端与装配（第 8 插件） | backend-core + qa | **PASS**（自动化） | `--task=watches`；`--task=watch-test -- <id>`；`go test ./test/ -run TestWatch` | ① **规则可创建/可开关**：方法链路 save→toggle(true)→toggle(false)→remove 全通，规则文件落 `<DataDir>/watches/<id>.json` 且删除时同步清理；② **试运行返回 metrics 且 matched 与条件一致**：条件 `quote.price > 10`（fake 现价 10.2）→ matched=true、metrics 含 `quote.price=10.2`；把条件改成 `> 100` → matched=false；headless 实测 `--task=watch-test -- w68aaf120f8f8` matched=true，metrics `sector.mainNet=4062413312`/`sector.changePct=2.97`；③ **文件改动 5s 内生效**：引擎 Tick=100ms 下改 `watches/*.json`，5s 内 `Get` 看到新 condition（实测 0.2s）；④ **DSL 无法执行代码**：`exec("rm -rf /")`、`os.system("rm")`、`import os`、`quote["price"]`、`eval(1)`、`quote.price > 1; rm -rf /`、反引号与 `__import__` 共 10 种写法全部解析失败，`Rule.Validate` 拒绝非白名单指标（`quote.foo`/`quote.constructor`/`window.location`/`process.env`）；⑤ **装配契约**：缺 `agent.runtime` 时 watch 激活失败且错误指向该服务与 agentlab；⑥ **默认关闭**：新建不传 `enabled` → false，tick 500ms 内零触发；显式 toggle 后才触发（RunLog triggered+matched） |
 
-**汇总：PASS 9（R1 R2 R3 R4-引擎 R6 R7 R8 R9 R10）· FAIL 0 · BLOCKED 1（R5，仅因 QA 环境无 API Key）**
+| R10.2 Watch 面板七步 | lead（手工） + frontend | **PASS**（人工浏览器验证，mock 数据） | 人工执行：打开面板 → 列表对比 `--task=watches` → 关闭/重开 → 试运行 → 触发日志 → 非法表达式；前端门禁 `npm run build` | 七步全部符合预期：① 面板正常渲染（研究组 order 35、导航第 4 项）；② 列表与 `--task=watches` 语义一致（3 条规则 / 2 条启用 / 带条件摘要与最近触发）；③ 关闭一条 → 开关状态变更；④ 重开 → 回 true；⑤ 试运行出「命中」徽标 + 场景表（300750 宁德时代 命中 / 688981 中芯国际 未命中，关键指标含现价/涨跌幅/量比/换手）+「渲染后的 prompt（Agent 实际收到）」+ 780ms，且**没有新增触发日志、没有新会话**（试运行只求值不触发，与引擎语义一致）；⑥ 触发日志 3 条含一条红色失败态「冷却中，600 秒内只派发一次」（冷却语义正确）；⑦ 非法表达式有前端中文校验，后端由 `TestRuleValidation`/`TestExprEval` + QA 的 10 条注入用例覆盖。限制：**人工步骤、mock 数据**，未自动化；状态栏 mock 已对齐真实值（插件 8/8、工具 27、面板 8、服务 6） |
+
+**汇总：PASS 9（R1 R2 R3 R4-引擎 R6 R7 R8 R9 R10.1+R10.2）· FAIL 0 · BLOCKED 1（R5，仅因 QA 环境无 API Key）**
 
 > R4 的双重标注：引擎与不变量已 PASS；`--task=quant` 的报告生成依赖模型，本机无 key 记 BLOCKED。
 > R6 的 D9（tool.call 摘要 43 字）已由 backend-core 修到 37 字、R7 的 D10（名称 GBK 乱码）已由 backend-data 修好，QA 均复跑确认 PASS。
@@ -231,7 +233,7 @@ QA 文档：本文件 + test/testdata/README.md（夹具口径）
 ## 6. 未覆盖项（诚实清单）
 
 1. **真实模型端到端**（无 key，QA 侧只用 fake LLM 验证循环不变量）。
-2. **前端交互**：只做 `vue-tsc + vite build` 门禁；面板点击、图表渲染、`window.go` 桥接在浏览器直开时的报错路径未自动化（api.ts 已显式提示）。
+2. **前端交互**：只做 `vue-tsc + vite build` 门禁；R10.2 的面板七步是**人工 + mock 数据**验证（有结论但不可回归）。面板点击、图表渲染、`window.go` 桥接在浏览器直开时的报错路径仍未自动化（api.ts 已显式提示）。
 3. **限速与重试的端到端行为**：令牌桶有单测，但没有"连续 200 次请求是否被限速、重试是否 ≤2"的集成验证。
 4. **审计持久化跨重启**：只验证了落库与读取，未验证进程重启后按时间窗查询。
 5. **自选同步的网页登录分支**（`needWebLogin`）与完全磁盘访问分支（`needFullDiskAccess`）未在真实环境触发验证。
