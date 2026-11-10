@@ -741,7 +741,10 @@ button {
 .toasts {
   position: fixed;
   right: 16px;
-  bottom: calc(var(--h-bot) + 14px);
+  /* 抬高到面板底部操作栏（运行/发送按钮）之上，避免 toast 拦截点击 */
+  bottom: calc(var(--h-bot) + 100px);
+  max-height: calc(100vh - var(--h-top) - var(--h-bot) - 140px);
+  overflow-y: auto;
   z-index: 60;
   display: flex;
   flex-direction: column;
