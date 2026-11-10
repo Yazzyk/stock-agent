@@ -565,6 +565,23 @@ let kernelListener: ((e: KernelEvent) => void) | null = null
 let stopped = false
 /** 演示用：当前正在运行的 session，用于校验插话请求。 */
 let mockRunningSession = ''
+/** 演示用：插话队列（真实后端上限 5 条），约每 2.4 秒被"下一步"读走一条。 */
+let mockSteerQueue = 0
+const MOCK_STEER_QUEUE_MAX = 5
+let mockSteerTimer: number | null = null
+
+function startSteerDrain(): void {
+  if (mockSteerTimer !== null) window.clearInterval(mockSteerTimer)
+  mockSteerTimer = window.setInterval(() => {
+    if (mockSteerQueue > 0) mockSteerQueue -= 1
+  }, 2400)
+}
+
+function stopSteerDrain(): void {
+  if (mockSteerTimer !== null) window.clearInterval(mockSteerTimer)
+  mockSteerTimer = null
+  mockSteerQueue = 0
+}
 
 export function subscribeMockKernel(cb: (e: KernelEvent) => void): void {
   kernelListener = cb
@@ -610,6 +627,8 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   const id = 's-demo-' + Date.now().toString(36)
   stopped = false
   mockRunningSession = id
+  mockSteerQueue = 0
+  startSteerDrain()
   const wantsWatchRule = /watchdog\.create/.test(input)
   const createdRule = wantsWatchRule ? watchCreateFromDescription(input) : null
   emit('agent.state', { sessionId: id, state: 'thinking', detail: '准备上下文' })
@@ -637,6 +656,7 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   }
   sessions.unshift(session)
   mockRunningSession = ''
+  stopSteerDrain()
   if (!stopped) emit('agent.report', { sessionId: id, worker, report, usage })
   emit('agent.state', { sessionId: id, state: stopped ? 'error' : 'done', detail: stopped ? '已手动停止' : '' })
   return { sessionId: id, worker, report, steps: 6, usage }
@@ -1569,11 +1589,15 @@ export function createMockBridge(): GoBridge {
           const text = String(p.text ?? '').trim()
           if (text === '') throw new Error('插话内容不能为空')
           if (sid === '' || sid !== mockRunningSession) throw new Error('会话已结束，无法插话（请重新运行后再试）')
-          if (text.length > 200) throw new Error('插话队列已满：请等 Agent 处理完当前步骤再发')
+          if (mockSteerQueue >= MOCK_STEER_QUEUE_MAX) {
+            throw new Error('插话队列已满：最多排队 ' + MOCK_STEER_QUEUE_MAX + ' 条，请等 Agent 处理完再发')
+          }
+          mockSteerQueue += 1
+          const queued = mockSteerQueue
           window.setTimeout(() => {
-            if (mockRunningSession === sid) emit('agent.steer', { sessionId: sid, text })
-          }, 280)
-          out = { ok: true, queued: 1 }
+            if (mockRunningSession === sid) emit('agent.steer', { sessionId: sid, text, queued })
+          }, 260)
+          out = { ok: true, queued, sessionId: sid }
         } else if (method === 'stop') {
           stopped = true
           out = { ok: true }
