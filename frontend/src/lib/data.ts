@@ -29,6 +29,11 @@ import type {
   SkillContent,
   StrategySpec,
   WalkForwardResponse,
+  WatchListPayload,
+  WatchRule,
+  WatchRunLog,
+  WatchTemplatesPayload,
+  WatchTestResult,
   SkillInfo,
   StockRef,
   SyncResult,
@@ -53,6 +58,11 @@ import {
   toQuantResult,
   toStrategySpec,
   toWalkForward,
+  toWatchList,
+  toWatchLog,
+  toWatchMetric,
+  toWatchRule,
+  toWatchTest,
   toQuote,
   toSector,
   toSkill,
@@ -384,6 +394,73 @@ export function quantWalkForward(code: string, strategy: string, folds = 3, limi
     return {
       result: toWalkForward(r.result),
       report: pickStr(r, 'report') ?? '',
+    }
+  })
+}
+
+// ---------- Watch 哨兵（插件 id=watch，工具名 watchdog.*） ----------
+
+export function watchdogList(): Promise<WatchListPayload> {
+  return guard('读取 Watch 规则', async () => toWatchList(await invoke('watch', 'list', {})))
+}
+
+export interface WatchSaveResult {
+  rule: WatchRule
+  rules: WatchRule[]
+}
+
+export function watchdogSave(rule: WatchRule): Promise<WatchSaveResult> {
+  const payload: Record<string, unknown> = {
+    name: rule.name,
+    enabled: rule.enabled,
+    sources: rule.sources,
+    condition: rule.condition,
+    action: rule.action,
+    cooldownSeconds: rule.cooldownSeconds ?? 300,
+    quietWindows: rule.quietWindows ?? [],
+  }
+  if (rule.id) payload.id = rule.id
+  if (rule.description) payload.description = rule.description
+  return guard('保存 Watch 规则', async () => {
+    const r = rec(await invoke('watch', 'save', payload)) ?? {}
+    return {
+      rule: toWatchRule(r.rule),
+      rules: arr(r.rules).map(toWatchRule),
+    }
+  })
+}
+
+export function watchdogToggle(id: string, enabled: boolean): Promise<WatchRule> {
+  return guard('切换规则开关', async () => {
+    const r = rec(await invoke('watch', 'toggle', { id, enabled })) ?? {}
+    return toWatchRule(r.rule)
+  })
+}
+
+export function watchdogRemove(id: string): Promise<WatchRule[]> {
+  return guard('删除规则', async () => {
+    const r = rec(await invoke('watch', 'remove', { id })) ?? {}
+    return arr(r.rules).map(toWatchRule)
+  })
+}
+
+export function watchdogTest(id: string): Promise<WatchTestResult> {
+  return guard('试运行规则', async () => toWatchTest(await invoke('watch', 'test', { id })))
+}
+
+export function watchdogLogs(limit = 50): Promise<WatchRunLog[]> {
+  return guard('读取触发日志', async () => {
+    const r = rec(await invoke('watch', 'logs', { limit })) ?? {}
+    return arr(r.logs).map(toWatchLog)
+  })
+}
+
+export function watchdogTemplates(): Promise<WatchTemplatesPayload> {
+  return guard('读取规则模板', async () => {
+    const r = rec(await invoke('watch', 'templates', {})) ?? {}
+    return {
+      templates: arr(r.templates).map(toWatchRule),
+      metrics: arr(r.metrics).map(toWatchMetric).filter((m) => m.name !== ''),
     }
   })
 }

@@ -29,13 +29,14 @@ const (
 )
 
 type Options struct {
-	Logger *slog.Logger
-	Store  contract.Store
-	Data   contract.DataService
-	LLM    contract.LLMService
-	Guard  contract.Guard
-	Audit  contract.Audit
-	Clock  func() time.Time
+	Logger  *slog.Logger
+	Store   contract.Store
+	Data    contract.DataService
+	LLM     contract.LLMService
+	Guard   contract.Guard
+	Audit   contract.Audit
+	Clock   func() time.Time
+	DataDir string
 }
 
 type entry struct {
@@ -201,6 +202,7 @@ func (k *Kernel) activate(ctx context.Context, id string) {
 		Manifest:     e.manifest,
 		Log:          k.log.With("plugin", id),
 		Clock:        k.opts.Clock,
+		DataDir:      k.opts.DataDir,
 		Tools:        tools,
 		ToolHost:     k,
 		UI:           ui,

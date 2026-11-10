@@ -83,7 +83,62 @@ Go 侧结构体 tag 用 camelCase，与本文件字段名逐字一致。**任何
 服务：`quant.engine`（供 agentlab 的 quant worker 调用）。
 UI slot：id=quant、component=quant、title=量化研究、group=研究、order=45。
 
-## 6. 插件 knowledge（面板组件 `knowledge`）
+## 5.6 插件 watch（面板组件 \`watch\`，Watch 哨兵）
+
+规则结构：
+
+\`\`\`json
+{
+  "id": "w1a2b3c4d5e6",
+  "name": "半导体资金异动",
+  "enabled": true,
+  "sources": [
+    {"type": "sector", "sector": "半导体", "kind": "sector"},
+    {"type": "quote", "codes": ["603278", "688981"]},
+    {"type": "kline", "codes": ["600000"], "period": "day"},
+    {"type": "news", "keyword": "并购重组", "kind": "notice"},
+    {"type": "schedule", "times": ["09:20", "14:50"]}
+  ],
+  "condition": "sector.mainNetYi > 20 and quote.changePct > 3",
+  "action": {"worker": "intraday", "prompt": "板块 {sector} 主力净流入 {sector.mainNetYi} 亿元，{code} 涨 {quote.changePct}%。请判断持续性。"},
+  "cooldownSeconds": 600,
+  "quietWindows": ["11:30-13:00"],
+  "lastError": "",
+  "triggerCount": 3
+}
+\`\`\`
+
+| method | 入参 | 返回 |
+|---|---|---|
+| \`list\` | \`{}\` | \`{rules: Rule[], running: boolean, metrics: [{name,label,unit}], logs: RunLog[]}\` |
+| \`save\` | \`Rule\`（id 空=新建） | \`{rule: Rule, rules: Rule[]}\` |
+| \`toggle\` | \`{id, enabled}\` | \`{rule: Rule}\` |
+| \`remove\` | \`{id}\` | \`{rules: Rule[]}\` |
+| \`test\` | \`{id}\` | \`{ruleId, matched, scenarios: [{code?,name?,sector?,metrics,matched}], summary, prompt, error?, elapsedMs}\` |
+| \`logs\` | \`{limit}\` | \`{logs: RunLog[]}\` |
+| \`templates\` | \`{}\` | \`{templates: Rule[], metrics: []}\` |
+| \`metrics\` | \`{}\` | \`{metrics: [{name,label,unit}]}\` |
+| \`state\` | \`{}\` | \`{running, rules}\` |
+
+RunLog：\`{time, ruleId, ruleName, worker, triggered, matched, summary, metrics, report, error, elapsedMs}\`。
+
+**条件 DSL（安全边界）**：只支持数字、布尔、比较（\`> >= < <= == !=\`）、逻辑（\`and/&&\`、\`or/||\`、\`not/!\`）与括号；
+标识符只能取白名单指标（\`watch.metrics\` 返回），**不支持函数调用、下标、属性链之外的访问、字符串、网络或任何副作用**；
+未知指标在保存时即被拒绝。规则里没有可执行代码，这是"Agent 可以生成规则但不能生成脚本"的边界。
+
+指标清单（与 \`internal/watch/expr.go\` 同源）：
+quote.price / quote.changePct / quote.volumeRatio / quote.turnover / quote.amount；
+flow.mainNet（元）/ flow.mainNetYi（亿）/ flow.mainNetPct（净额÷成交额）；
+sector.changePct / sector.mainNet / sector.mainNetYi；
+kline.rsi / kline.ma20dev / kline.volumeRatio / kline.macd / kline.aboveMA20 / kline.atrPct；
+news.hits / news.negative；time.trading / time.hour / time.minute。
+
+工具：\`watchdog.list\`、\`watchdog.create\`（Risk=write，Agent 用它把用户需求写成规则）、\`watchdog.toggle\`（write）、\`watchdog.test\`（network）、\`watchdog.logs\`。
+服务：\`watch.engine\`。
+UI slot：id=watch、component=watch、title="Watch 哨兵"、group=研究、order=35。
+规则文件：\`<DataDir>/watches/<id>.json\`（改文件即热加载，相当于一个可开关的插件）。
+
+## 6. 插件 knowledge（面板组件 \`knowledge\`）
 
 | method | 入参 | 返回 |
 |---|---|---|
@@ -125,10 +180,11 @@ llm.New(cfg llm.Config) (contract.LLMService, error)
 | `market_cache` | datasource |
 | `kb_docs` `kb_chunks` `kb_meta` | knowledge / progressive |
 | `sessions` `session_events` | agent |
+| `watch_rules` `watch_runs` | watch（规则与触发日志） |
 | `audit` | security |
 
 ## 10. 面板 / 导航
 
 UI slot 的 `component` 与前端 `src/panels/<name>.vue` 文件名一致；
-group 取值：`行情`（watchlist/fundflow/kline）、`研究`（agentlab/quant/knowledge）、`设置`（modelsettings）。
-order：watchlist 10、fundflow 20、kline 30、agentlab 40、quant 45、knowledge 50、modelsettings 90。
+group 取值：`行情`（watchlist/fundflow/kline）、`研究`（watch/agentlab/quant/knowledge）、`设置`（modelsettings）。
+order：watchlist 10、fundflow 20、kline 30、watch 35、agentlab 40、quant 45、knowledge 50、modelsettings 90。

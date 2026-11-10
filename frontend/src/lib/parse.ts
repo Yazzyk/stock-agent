@@ -10,6 +10,14 @@ import type {
   QuantResult,
   QuantTrade,
   StrategySpec,
+  WatchListPayload,
+  WatchMetricSpec,
+  WatchRule,
+  WatchRunLog,
+  WatchScenario,
+  WatchSource,
+  WatchSourceType,
+  WatchTestResult,
   WalkForwardFold,
   WalkForwardResult,
   Bar,
@@ -470,5 +478,118 @@ export function toKlineAnalyze(v: unknown): KlineAnalyzeResponse {
     warning: pickStr(r, 'warning', 'stale'),
     support: toNumList(pickArr(r, 'support')),
     resistance: toNumList(pickArr(r, 'resistance')),
+  }
+}
+
+// ---------- Watch 哨兵 ----------
+
+function numMap(v: unknown): Record<string, number> {
+  const r = rec(v) ?? {}
+  const out: Record<string, number> = {}
+  for (const k of Object.keys(r)) {
+    const n = pickNum(r, k)
+    if (n !== undefined) out[k] = n
+  }
+  return out
+}
+
+export function toWatchSource(v: unknown): WatchSource {
+  const r = rec(v) ?? {}
+  const rawType = pickStr(r, 'type') ?? 'quote'
+  const type: WatchSourceType =
+    rawType === 'sector' || rawType === 'kline' || rawType === 'news' || rawType === 'schedule' ? rawType : 'quote'
+  return {
+    type,
+    codes: strList(pickArr(r, 'codes')),
+    sector: pickStr(r, 'sector'),
+    kind: pickStr(r, 'kind'),
+    keyword: pickStr(r, 'keyword'),
+    period: pickStr(r, 'period'),
+    times: strList(pickArr(r, 'times')),
+  }
+}
+
+export function toWatchRule(v: unknown): WatchRule {
+  const r = rec(v) ?? {}
+  const action = rec(r.action) ?? {}
+  return {
+    id: pickStr(r, 'id'),
+    name: pickStr(r, 'name') ?? '未命名规则',
+    description: pickStr(r, 'description'),
+    enabled: pickBool(r, 'enabled') ?? false,
+    sources: pickArr(r, 'sources').map(toWatchSource),
+    condition: pickStr(r, 'condition') ?? 'true',
+    action: {
+      worker: pickStr(action, 'worker') ?? 'intraday',
+      prompt: pickStr(action, 'prompt') ?? '',
+    },
+    cooldownSeconds: pickNum(r, 'cooldownSeconds'),
+    quietWindows: strList(pickArr(r, 'quietWindows')),
+    createdBy: pickStr(r, 'createdBy'),
+    createdAt: pickStr(r, 'createdAt'),
+    updatedAt: pickStr(r, 'updatedAt'),
+    lastTriggeredAt: pickStr(r, 'lastTriggeredAt'),
+    triggerCount: pickNum(r, 'triggerCount'),
+    lastError: pickStr(r, 'lastError'),
+  }
+}
+
+export function toWatchMetric(v: unknown): WatchMetricSpec {
+  const r = rec(v) ?? {}
+  return {
+    name: pickStr(r, 'name') ?? '',
+    label: pickStr(r, 'label') ?? '',
+    unit: pickStr(r, 'unit'),
+  }
+}
+
+export function toWatchLog(v: unknown): WatchRunLog {
+  const r = rec(v) ?? {}
+  return {
+    time: pickStr(r, 'time') ?? '',
+    ruleId: pickStr(r, 'ruleId') ?? '',
+    ruleName: pickStr(r, 'ruleName') ?? '',
+    worker: pickStr(r, 'worker') ?? '',
+    triggered: pickBool(r, 'triggered') ?? false,
+    matched: pickBool(r, 'matched') ?? false,
+    summary: pickStr(r, 'summary'),
+    metrics: rec(r.metrics) ? numMap(r.metrics) : undefined,
+    report: pickStr(r, 'report'),
+    error: pickStr(r, 'error'),
+    elapsedMs: pickNum(r, 'elapsedMs'),
+  }
+}
+
+export function toWatchScenario(v: unknown): WatchScenario {
+  const r = rec(v) ?? {}
+  return {
+    code: pickStr(r, 'code'),
+    name: pickStr(r, 'name'),
+    sector: pickStr(r, 'sector'),
+    metrics: numMap(r.metrics),
+    matched: pickBool(r, 'matched') ?? false,
+  }
+}
+
+export function toWatchTest(v: unknown): WatchTestResult {
+  const r = rec(v) ?? {}
+  return {
+    ruleId: pickStr(r, 'ruleId') ?? '',
+    matched: pickBool(r, 'matched') ?? false,
+    scenarios: pickArr(r, 'scenarios').map(toWatchScenario),
+    summary: pickStr(r, 'summary') ?? '',
+    prompt: pickStr(r, 'prompt') ?? '',
+    error: pickStr(r, 'error'),
+    elapsedMs: pickNum(r, 'elapsedMs'),
+  }
+}
+
+export function toWatchList(v: unknown): WatchListPayload {
+  const r = rec(v) ?? {}
+  return {
+    rules: pickArr(r, 'rules').map(toWatchRule),
+    running: pickBool(r, 'running') ?? false,
+    metrics: pickArr(r, 'metrics').map(toWatchMetric).filter((m) => m.name !== ''),
+    logs: pickArr(r, 'logs').map(toWatchLog),
   }
 }

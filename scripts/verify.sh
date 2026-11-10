@@ -26,11 +26,15 @@ WITH_NETWORK=0
 VERBOSE=0
 KEEP_LOGS=0
 
-# EXPECT_PLUGINS 是"插件装配数下限"，默认按最终验收的 7 个内置插件
-# （watchlist / fundflow / kline / agentlab / knowledge / modelsettings / quant）。
+# EXPECT_PLUGINS 是"插件装配数下限"，默认按最终验收的 8 个内置插件
+# （watchlist / fundflow / kline / agentlab / knowledge / modelsettings / quant / watch）。
 # 交付中期插件尚未全接线时必然不达标——这是"集成末期生效"的门禁，
 # 需要中期跑绿可以显式传 --expect-plugins=0 关掉该断言。
-EXPECT_PLUGINS=7
+EXPECT_PLUGINS=8
+
+# EXPECT_TOOLS 是"工具索引条数下限"。实测基线：8 个插件 / 27 个工具
+# （lead 报的是 28，实测 27，差 1 已回报待确认）。传 0 关闭该断言；新增工具时同步上调。
+EXPECT_TOOLS=27
 
 usage() {
   cat <<'USAGE'
@@ -213,16 +217,26 @@ step_headless_tools() {
   start=$(_now_ms)
   go run . --headless --task=tools >"$log" 2>&1
   code=$?
-  if [ "$code" -eq 0 ] && ! grep -Eq '^[a-z0-9]+(\.[a-z0-9_]+)+ +\[(read|network|write|exec)\]' "$log"; then
+  local count
+  count="$(grep -cE '^[a-z0-9]+(\.[a-z0-9_]+)+ +\[(read|network|write|exec) *\]' "$log" 2>/dev/null || true)"
+  count="${count:-0}"
+  if [ "$code" -eq 0 ] && [ "$count" -eq 0 ]; then
     {
       echo ""
       echo "断言失败: 工具索引为空（没有一行形如 'market.quote  [network] ...'）"
       echo "含义: plugins/builtin 未装配具体插件，或插件没有注册任何工具。"
     } >>"$log"
     code=3
+  elif [ "$code" -eq 0 ] && [ "$EXPECT_TOOLS" -gt 0 ] && [ "$count" -lt "$EXPECT_TOOLS" ]; then
+    {
+      echo ""
+      echo "断言失败: 工具索引 ${count} 条 < 期望 ${EXPECT_TOOLS}"
+      echo "含义: 有插件没注册工具，或 EXPECT_TOOLS 需要随新插件上调。"
+    } >>"$log"
+    code=7
   fi
   end=$(_now_ms)
-  record "headless: 工具索引" "$code" "$start" "$end" "$log" "断言：至少 1 个工具且带风险等级"
+  record "headless: 工具索引" "$code" "$start" "$end" "$log" "断言 ≥ ${EXPECT_TOOLS} 个工具且带风险等级（0=只查非空）"
 }
 
 # step_network_chain 是联网数据链路断言（--with-network 才跑）：

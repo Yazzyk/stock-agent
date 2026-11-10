@@ -371,6 +371,63 @@ build exit=0
 
 ---
 
+## R10 自定义 Watchdog
+
+| 项 | 内容 |
+|---|---|
+| 归属 | backend-core（引擎）+ watch 插件 + frontend（面板） |
+| 状态 | 引擎、工具与面板均已交付（`watch.vue` 已通过浏览器验证）；**R10.2 面板验收项待执行** |
+| Given | `~/.guanlan/watches/` 可写；引擎已随插件启动（Tick 30 秒，仅交易时段求值） |
+| When | 创建规则 → 试运行 → 开关 → 看触发日志 → 改规则文件验证热加载 → 在面板里做同样四件事 |
+| Then | 规则文件生成且可列出；试运行只求值不触发；toggle 立即生效；日志可查；改文件 30 秒内生效；面板可打开并对同一批规则完成开关与试运行 |
+
+### R10.1 引擎与工具（现在就能跑）
+
+```sh
+go test ./internal/watch ./plugins/watch -count=1
+go run . --headless --task=watches
+go run . --headless --task=watch-test -- <规则ID>
+```
+
+期望输出：
+
+- `go test`：两个包均 `ok`（引擎求值、条件解析、限流、热加载、插件方法各有断言）；
+- `watches`：`{"rules": [...], "logs": [...], "metrics": [22 条], "running": true}`；
+- `watch-test`：`{"ruleId", "matched", "scenarios": [{"code"|"sector", "metrics", "matched"}], "summary", "prompt", "elapsedMs"}`，且**不产生新的触发日志**。
+
+### R10.2 面板（正式验收项，已可执行）
+
+| 步骤 | 期望 |
+|---|---|
+| 打开「Watch 哨兵」（研究组，序 35） | 正常渲染规则列表，不出现「面板组件缺失」 |
+| 列表内容 | 与 `--task=watches` 的 `rules` 一致（名称、触发源摘要、条件、开关状态、最近触发、触发次数） |
+| 关闭一条规则 | 行内状态立即变为关闭；`--task=watches` 里该规则 `enabled=false` |
+| 重新打开该规则 | 行内状态恢复；`--task=watches` 里 `enabled=true` |
+| 点该行「试运行」 | 出现命中徽标与 scenarios 表（标的/关键指标/是否命中/耗时）；**不新增触发日志**、不启动 Agent 会话 |
+| 打开「触发日志」 | 时间、规则名、worker、指标快照、结论摘要、错误原因；无记录时显示空态文案 |
+| 条件输入非法表达式（如 `quote.changePct > avg(3)`） | 即时红字报错并禁止保存；不出现脚本输入框 |
+
+命令（面板步骤为 GUI 手工执行，可先用下面两条准备数据）：
+
+```sh
+go run . --headless --task=watches                 # 对照面板列表是否一致
+go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结果
+```
+
+判 FAIL 的条件：
+
+- 条件里写函数、网络调用或任何非白名单标识仍被接受（DSL 越界，安全红线）；
+- 试运行触发了 Agent（日志里多出 `triggered=true` 且 `report` 非空）；
+- 改 `~/.guanlan/watches/*.json` 后 30 秒仍未生效；
+- `enabled=false` 的规则仍然触发；
+- 冷却期（`cooldownSeconds`）内重复触发，或单小时触发超过 6 次；
+- 面板打开即「面板组件缺失」、开关不写入 `enabled`、试运行页面与 `watch-test` 结果不一致。
+
+判 BLOCKED 的条件：`--task=plugins` 里没有 `watch`（插件未激活）。面板已交付，R10.2 可直接执行；尚未执行时记「待执行」，不记 FAIL。
+
+
+---
+
 ## 附录 A 当前基线（接线完成后实测）
 
 采集于集成末期。总览与面板清单为本机实跑输出，R3–R9 的结论取自 lead 的集成实测记录。
@@ -378,12 +435,12 @@ build exit=0
 ### A.1 总览
 
 ```
-插件: 7 个，已激活 7 个；工具 22 个；面板 7 个
-服务: agent.runtime, kb.store, kline.engine, llm, quant.engine
+插件: 8 个，已激活 8 个；工具 27 个；面板 8 个
+服务: agent.runtime, kb.store, kline.engine, llm, quant.engine, watch.engine
 结果: OK
 ```
 
-> 工具数以 `--task=tools` 实测为准，22 个 = 上表合计（knowledge 含 `kb.import`，早期台账的 21 是加它之前的数，已作废）。
+> 工具数以 `--task=tools` 实测为准（27 个 = 下表合计，其中 watch 插件贡献 `watchdog.list/create/toggle/test/logs` 5 个）。
 
 | 插件 | 版本 | 工具 | 方法 | 面板 |
 |---|---|---|---|---|
@@ -393,8 +450,9 @@ build exit=0
 | knowledge | 1.0.0 | 7 | 6 | 1 |
 | modelsettings | 0.1.0 | 0 | 4 | 1 |
 | quant | 0.1.0 | 1 | 3 | 1 |
+| watch | 0.1.0 | 5 | 9 | 1 |
 | watchlist | 1.0.0 | 4 | 5 | 1 |
-| **合计** | — | **22** | **28** | **7** |
+| **合计** | — | **27** | **37** | **8** |
 
 ### A.2 面板清单（与 `docs/API.md` §10 一致）
 
@@ -403,24 +461,26 @@ build exit=0
 | watchlist | 自选股 | watchlist | 行情 | 10 |
 | fundflow | 资金流向 | fundflow | 行情 | 20 |
 | kline | K线分析 | kline | 行情 | 30 |
+| watch | Watch 哨兵 | watch | 研究 | 35 |
 | agentlab | Agent 实验室 | agentlab | 研究 | 40 |
 | quant | 量化研究 | quant | 研究 | 45 |
 | knowledge | 知识库 | knowledge | 研究 | 50 |
 | modelsettings | 模型设置 | modelsettings | 设置 | 90 |
 
-### A.3 R1–R9 结论
+### A.3 R1–R10 结论
 
 | 条目 | 结论 | 证据 |
 |---|---|---|
 | R1 删除教学代码 | 通过 | `cmd/mini` 不存在 |
-| R2 插件架构 | 通过 | 7/7 激活，工具 22 |
+| R2 插件架构 | 通过 | 8/8 激活，工具 27 |
 | R3 数据层 | 通过 | 实测 5/5 live |
 | R4 回测 | 通过 | 11 项测试；报告含成本四行（佣金/印花税/过户费/滑点） |
 | R5 Agent harness | 通过 | 盘前任务用真实模型跑 8 步并产出计划 |
 | R6 渐进式披露 | 通过 | `tool.*` / `skill.*` / `kb.*` 齐备，预算裁剪有测试覆盖 |
 | R7 自选同步 | 通过 | 20 组 163 只，`source=ths-local` |
-| R8 面板 | 通过 | 7 个面板已在桌面端验证 |
+| R8 面板 | 通过 | 8 个面板均在桌面端验证；`watch` 面板浏览器验证通过（规则列表/开关/编辑器/指标 chips/一句话创建/触发日志） |
 | R9 安全 | 通过 | 脱敏、白名单、路径、审计均通过；工具索引无 `exec` |
+| R10 自定义 Watchdog | 引擎、工具、面板均已交付；R10.2 待执行 | 5 个 `watchdog.*` 工具齐备；规则热加载、试运行、日志、限流有单测；`watch.vue` 已交付并通过浏览器验证 |
 
 ### A.4 交付时不计为失败的已知限制
 
@@ -430,8 +490,9 @@ build exit=0
 | 周期 | 仅 `day`/`week`/`month`/`min60` | `min15`/`min5`/`min1` 不支持，请求时需明确报错 |
 | K 线主源 | 东财 K 线端点不可达 | K 线以同花顺为主源；东财仍提供资金流与板块数据 |
 | 情绪指标 | 涨停家数 / 炸板率 / 连板高度无工具 | 知识库 `theme-sentiment-cycle.md` 有口径，工具列 P1 |
+| Watch 条件能力 | 只支持 22 个白名单指标的数值比较 | 不支持自定义指标与函数；非交易时段不求值。越界表达式必须被解析器拒绝 |
 
-命中以上四条时不记 FAIL；但"静默降级"（没有角标、没有错误）仍记 FAIL。
+命中以上限制时不记 FAIL；但"静默降级"（没有角标、没有错误）仍记 FAIL。
 
 ## 附录 B 交叉复核清单（product ↔ 其它成员）
 
@@ -444,7 +505,7 @@ build exit=0
 | kb 每篇正文 300–800 汉字 | 10/10 | product |
 | 成本口径（DOMAIN 4.3）与回测实现一致 | 四项参数逐字一致 | backend-data |
 | 资金流分档（DOMAIN 2.1）与数据层实现一致 | f52 = f55 + f56 | backend-data |
-| 面板槽位与 `frontend/src/panels` 组件键一致 | 7 个键同名（watchlist/fundflow/kline/agentlab/quant/knowledge/modelsettings） | frontend |
+| 面板槽位与 `frontend/src/panels` 组件键一致 | 8 个槽位全部有组件（watchlist/fundflow/kline/watch/agentlab/quant/knowledge/modelsettings） | frontend |
 | 红涨绿跌变量 | `--up: #ef4b4b`、`--down: #2fbf71` | frontend |
 
 ## 附录 C 记录模板
@@ -457,8 +518,9 @@ build exit=0
 | 条目 | 结果 | 命令 | 证据 |
 |---|---|---|---|
 | R1 | PASS | test ! -d cmd/mini | PASS: 无 cmd/mini |
-| R2 | PASS | go test ./internal/kernel/ | ok 0.124s |
-| R3 | BLOCKED | go run . --headless --task=quote | 工具不存在: market.quote（backend-data 未接线） |
+| R2 | PASS | go test ./internal/kernel/ | ok 0.2xx s |
+| R3 | PASS | go run . --headless --task=quote -- 600000 | code=600000、price>0、source 非空 |
+| R10 | 待执行 | go run . --headless --task=watches | rules/logs/metrics 结构正确；面板步骤待跑 |
 ...
-汇总：PASS 2 / FAIL 0 / BLOCKED 7
+汇总：PASS n / FAIL n / BLOCKED n（按实际填，不写「部分通过」）
 ```

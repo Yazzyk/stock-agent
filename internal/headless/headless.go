@@ -83,6 +83,14 @@ func Run(ctx context.Context, k *kernel.Kernel, task string, args []string, w io
 		return callTool(ctx, k, "kb.search", map[string]any{"query": query, "limit": 5}, w)
 	case "skills":
 		return callTool(ctx, k, "skill.list", map[string]any{}, w)
+	case "watches", "watchdog":
+		return invoke(ctx, k, "watch", "list", map[string]any{}, w)
+	case "watch-test":
+		if len(args) == 0 {
+			fmt.Fprintln(w, "用法: --task=watch-test -- <规则ID>")
+			return 2
+		}
+		return invoke(ctx, k, "watch", "test", map[string]any{"id": args[0]}, w)
 	case "premarket", "postmarket", "monitor", "quant", "review", "plan":
 		worker := task
 		if worker == "review" {
@@ -99,7 +107,7 @@ func Run(ctx context.Context, k *kernel.Kernel, task string, args []string, w io
 		if _, ok := k.Tool(task); ok {
 			return callTool(ctx, k, task, map[string]any{}, w)
 		}
-		fmt.Fprintf(w, "未知任务 %q。可用: selftest|plugins|tools|quote|bars|watchlist|flow|analyze|strategies|backtest|walkforward|kbs|skills|premarket|postmarket|monitor|quant|chat|<工具名>\n", task)
+		fmt.Fprintf(w, "未知任务 %q。可用: selftest|plugins|tools|quote|bars|watchlist|flow|analyze|strategies|backtest|walkforward|kbs|skills|watches|watch-test|premarket|postmarket|monitor|quant|chat|<工具名>\n", task)
 		return 2
 	}
 }

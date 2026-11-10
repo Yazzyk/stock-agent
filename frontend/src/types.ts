@@ -506,6 +506,102 @@ export interface WalkForwardResponse {
   report: string
 }
 
+// ---------- Watch 哨兵（API.md §5.6，插件 id=watch） ----------
+
+export type WatchSourceType = 'quote' | 'sector' | 'kline' | 'news' | 'schedule'
+
+export interface WatchSource {
+  type: WatchSourceType
+  /** quote / kline */
+  codes?: string[]
+  /** sector：板块或概念名 */
+  sector?: string
+  /** sector: sector|concept；news: roll|notice */
+  kind?: string
+  /** news 关键词 */
+  keyword?: string
+  /** kline 周期，默认 day */
+  period?: string
+  /** schedule：["09:20","14:50"] */
+  times?: string[]
+}
+
+export interface WatchAction {
+  /** agentlab worker：chat/intraday/premarket/postmarket/quant */
+  worker: string
+  /** 模板，可用 {指标名}、{code}、{sector}、{summary} 占位 */
+  prompt: string
+}
+
+export interface WatchRule {
+  id?: string
+  name: string
+  description?: string
+  enabled: boolean
+  sources: WatchSource[]
+  condition: string
+  action: WatchAction
+  cooldownSeconds?: number
+  quietWindows?: string[]
+  createdBy?: string
+  createdAt?: string
+  updatedAt?: string
+  /** 运行时状态：不入库 */
+  lastTriggeredAt?: string
+  triggerCount?: number
+  lastError?: string
+}
+
+export interface WatchMetricSpec {
+  name: string
+  label: string
+  unit?: string
+}
+
+export interface WatchRunLog {
+  time: string
+  ruleId: string
+  ruleName: string
+  worker: string
+  triggered: boolean
+  matched: boolean
+  summary?: string
+  metrics?: Record<string, number>
+  report?: string
+  error?: string
+  elapsedMs?: number
+}
+
+export interface WatchScenario {
+  code?: string
+  name?: string
+  sector?: string
+  metrics: Record<string, number>
+  matched: boolean
+}
+
+export interface WatchTestResult {
+  ruleId: string
+  matched: boolean
+  scenarios: WatchScenario[]
+  summary: string
+  prompt: string
+  error?: string
+  elapsedMs?: number
+}
+
+export interface WatchListPayload {
+  rules: WatchRule[]
+  running: boolean
+  metrics: WatchMetricSpec[]
+  logs: WatchRunLog[]
+}
+
+export interface WatchTemplatesPayload {
+  templates: WatchRule[]
+  metrics: WatchMetricSpec[]
+}
+
 // ---------- 内核事件 ----------
 
 export interface KernelEvent {

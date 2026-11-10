@@ -57,6 +57,8 @@ go run . --headless --task=selftest
 | `quote` | 取快照，例：`--task=quote -- 600000` |
 | `bars` | 取 K 线，例：`--task=bars -- 600000 day 60` |
 | `watchlist` | 取自选列表 |
+| `watches` | 列出全部 Watch 规则、触发日志与可用指标 |
+| `watch-test` | 试运行一条规则，例：`--task=watch-test -- <规则ID>`（只求值，不触发 Agent） |
 | `premarket` / `postmarket` | 跑盘前 / 盘后 worker |
 | `monitor` | 跑盘中 worker |
 | `quant` | 跑量化 worker |
@@ -79,9 +81,9 @@ go run . --headless --task=selftest
 | 4 | 研究 → Agent 实验室 | 选 `premarket`，填一句话目标，点「运行」 | 「报告」标签出现当日计划正文，`~/.guanlan/runs/<日期>/plan.md` 已生成 |
 | 5 | 收盘后 | 选 `postmarket` 运行 | 出现 `review.md`，对账表能和早上的计划逐条对上 |
 
-## 3. 七个面板
+## 3. 八个面板
 
-左侧导航按分组排列，顺序即快捷键顺序：**行情**（自选 → 资金流 → K 线）、**研究**（Agent 实验室 → 量化研究 → 知识库）、**设置**（模型设置）。只显示已激活插件贡献的面板；少了某个面板时，按本节末尾的方法排查。
+左侧导航按分组排列，顺序即快捷键顺序：**行情**（自选 → 资金流 → K 线）、**研究**（Watch 哨兵 → Agent 实验室 → 量化研究 → 知识库）、**设置**（模型设置）。只显示已激活插件贡献的面板；少了某个面板时，按本节末尾的方法排查。
 
 ### 3.1 自选
 
@@ -109,7 +111,35 @@ go run . --headless --task=selftest
 - **复权口径**：面板请求前复权（`qfq`）。当前数据源没有真实复权序列，接口会显式降级为不复权（`adjust=none`），判读栏出现角标提示——这是已知限制，不会静默。要自己指定口径，用 `--task=bars` 传 `adjust` 参数。
 - **没有数据时**：面板显示「没有 K 线数据」，并提示确认代码是否正确、是否停牌或新股历史不足。历史少于 60 根时不要下趋势结论（判断标准见知识库《K 线形态手册》）。
 
-### 3.4 Agent 实验室
+### 3.4 Watch 哨兵
+
+- **它解决什么**：把「我盯着呢」变成「条件命中自动派一次研究任务」。你声明盯什么，引擎每 30 秒取数求值，命中后触发一次 Agent 任务，并把结论与指标写进触发日志。
+- **安全边界（先看这条）**：规则是**声明式 JSON**，条件只能对白名单指标做数值比较，**不能调用函数、不能访问网络、不能执行代码**。它是安全的表达式 DSL，不是脚本引擎；触发动作也只是「给 Agent 派一次带模板的任务」，不写任意文件、不接交易。
+- **可用指标（22 个）**：
+
+下表是可直接写进 `condition` 的完整标识符，共 22 个：
+
+| 前缀 | 指标 |
+|---|---|
+| `quote.` | `quote.price` 现价（元）、`quote.changePct` 涨跌幅（%）、`quote.volumeRatio` 量比、`quote.turnover` 换手率（%）、`quote.amount` 成交额（元） |
+| `flow.` | `flow.mainNet` 主力净额（元）、`flow.mainNetYi` 主力净额（亿元）、`flow.mainNetPct` 主力净额 ÷ 成交额（%） |
+| `sector.` | `sector.changePct` 板块涨跌幅（%）、`sector.mainNet` 板块主力净额（元）、`sector.mainNetYi` 板块主力净额（亿元） |
+| `kline.` | `kline.rsi` RSI(14)、`kline.ma20dev` 距 MA20（%）、`kline.volumeRatio` 5 日量比、`kline.macd` MACD 柱、`kline.aboveMA20` 站上 MA20（1/0）、`kline.atrPct` ATR 占收盘（%） |
+| `news.` | `news.hits` 命中公告/新闻条数、`news.negative` 负面词命中（1/0） |
+| `time.` | `time.trading` 是否交易时段（1/0）、`time.hour` 小时、`time.minute` 分钟 |
+
+- **规则字段**：`name`、`description`、`enabled`、`sources`（1–6 个）、`condition`、`action`、`cooldownSeconds`、`quietWindows`（如 `11:30-13:00`）。运行时会附带 `lastTriggeredAt`、`triggerCount`、`lastError`。
+- **触发源五种**：`quote`（个股，需 `codes`）、`sector`（板块/概念名，`sector` + `kind`）、`kline`（个股 + `period`，默认 day）、`news`（`keyword` + `kind`=notice/roll）、`schedule`（`times`，如 09:20）。
+- **条件语法**（契约见 `docs/API.md` §5.6）：数值比较 `> >= < <= == !=`（实现也接受 `=` 与 `<>`），逻辑 `and`/`or`/`not`（也接受 `&&`/`||`/`!`），支持括号与 `true`/`false`。例：`sector.mainNetYi > 20 and quote.changePct > 3`。
+- **动作**：`action.worker` 取 `chat`/`intraday`/`premarket`/`postmarket`/`quant`；`action.prompt` 是模板，可插入 `{quote.changePct}`、`{sector.mainNetYi}`、`{keyword}`、`{summary}` 等占位。
+- **试运行看什么**（`test`，不触发 Agent）：`matched` 是否命中、`scenarios[]` 每个标的/板块的 `metrics` 实测值与是否命中、`summary` 一句话结论、`prompt` 会发给 Agent 的原文、`elapsedMs` 取数耗时。先试运行再启用，是避免误报的标准动作。
+- **触发日志**（`logs` / `--task=watches`）：时间、规则名、worker、是否触发、指标快照、Agent 结论、错误原因、耗时；最多保留 200 条。
+- **限流与时段**：单规则按 `cooldownSeconds` 冷却；全局每小时最多 6 次触发；非交易时段不求值（`TradingOnly`）。
+- **文件即插件**：规则落在 `~/.guanlan/watches/<id>.json`，改文件后 30 秒内热加载生效，不用重启。
+- **用一句话让 Agent 写规则**：直接说需求，Agent 调 `watchdog.create` 生成规则（可用 `watchdog.list` 查、`watchdog.toggle` 开关、`watchdog.test` 试运行、`watchdog.logs` 看日志）。例：「半导体板块主力净流入超过 20 亿就提醒我看看持续性」。
+- **面板已交付**（研究组，序 35）：顶部是「一句话创建」输入框（让 Agent 把需求写成规则）与「从模板新建 / 新建规则 / 刷新」；左侧规则列表带开关与最近触发；右侧编辑器可增删触发源、写条件（下方指标 chips 点一下即插入对应指标名）、保存 / 试运行 / 删除；底部是触发日志与「刷新日志」。没有规则时提示「还没有 Watch 规则」，并说明规则命中只会派一次 Agent 任务。命令行等价入口：`--task=watches`、`--task=watch-test -- <id>`。
+
+### 3.5 Agent 实验室
 
 - **界面**：左侧是 worker 列表（`chat` / `premarket` / `intraday` / `postmarket` / `quant`）与历史会话；右侧是「日志 / 报告」两个标签，日志实时滚动，报告是运行产物的正文。顶部有「清空 / 停止 / 运行」，下方是任务输入框。
 - **能做什么**：跑任务（`run`）、停止（`stop`）、会话列表（`sessions`）、会话回放（`session`）。
@@ -117,7 +147,7 @@ go run . --headless --task=selftest
 - **产物**：运行结束返回 `artifacts`（名称 + 路径），文件落在 `~/.guanlan/runs/<日期>/`；当前面板只显示报告正文，产物清单以该目录为准。
 - **任意面板查看**：按 `⌘J` 打开运行抽屉，不必切回本面板。
 
-### 3.5 量化研究
+### 3.6 量化研究
 
 - **界面**：上方参数表单（策略、代码、周期、初始资金、折数），右上「运行回测」与「walk-forward」两个按钮；下方结果区分「回测报告 / walk-forward」两个标签。
 - **结果区**：指标卡（总收益、年化、最大回撤、夏普、胜率、交易笔数、换手、期末权益）、成本卡（佣金、印花税、过户费、滑点、成本合计、区间）、净值曲线、报告正文。
@@ -127,7 +157,7 @@ go run . --headless --task=selftest
 - **降级提示**：没有真实复权序列时，面板顶部出现黄色警告条，说明本次按不复权计算。
 - **注意**：回测结论只用于检验规则，不是选股依据；面板副标题固定写「只读研究：回测结论不等于未来收益」。
 
-### 3.6 知识库
+### 3.7 知识库
 
 - **界面**：顶部「检索 / 文档 / 技能」三个标签，右侧阅读器，右上角「导入」。
 - **能做什么**：检索（`search`）、文档列表（`list`）、打开全文（`open`）、导入（`import`）、技能目录（`skills`）、查看技能（`skill`）。
@@ -135,13 +165,13 @@ go run . --headless --task=selftest
 - **导入**：粘贴 Markdown 正文，可填标题与标签，点「确认导入」。
 - **技能是什么**：一段可执行流程。模型按它做事，而不是每次重新解释方法论。
 
-### 3.7 模型设置
+### 3.8 模型设置
 
 - **界面**：provider 列表 + 编辑表单 + 连通测试；底部有一行安全说明（模型调用经 Guard 白名单与限速，超时 8 秒）。完整策略由内核 `Status()` 提供，审计记录由 `Audit()` 提供，界面暂未单独设页。
 - **能做什么**：列表（`list`）、保存（`save`）、测试（`test`）、删除（`remove`）。
 - **密钥**：输入框掩码，保存后不回显。接口 `apiKey` 只写不读，任何返回都不含明文密钥。
 
-七个面板里若少了某个，用 `go run . --headless --task=plugins` 看该插件是否激活；`--task=selftest` 末尾显示「结果: OK」表示全部激活（当前 7/7）。
+八个面板里若少了某个，用 `go run . --headless --task=plugins` 看该插件是否激活；`--task=selftest` 末尾显示「结果: OK」表示全部激活（当前 8/8）。若导航里有该项、点开却显示「面板组件缺失」，那是前端组件未交付，不是插件没激活。
 
 ## 4. 四个标准操作流
 
@@ -179,6 +209,30 @@ go run . --headless --task=selftest
 3. **读报告**：`report.md` 第一节必须是五关自检——未来函数、样本内外、walk-forward、幸存者偏差、参数敏感性。
 4. **核对成本**：报告必须列出佣金、印花税、过户费、滑点四行，口径与 `docs/DOMAIN.md` §4.3 一致（往返约 0.262%）。
 5. **不通过的结论不看绩效**：自检书没通过，后面的年化数字没有意义。
+
+### 4.5 自定义盯盘（Watch 哨兵）
+
+适用：你有几条固定的关注点，但不可能一直盯盘。把它们写成规则，命中时让 Agent 去看一眼并把结论留在日志里。
+
+**标准动作（无论盯什么，顺序都一样）**：
+
+1. **写规则**：说清楚「盯谁 + 什么条件 + 命中后让谁做什么」。可以直接对 Agent 说，让它调 `watchdog.create`；也可以自己写 JSON 放进 `~/.guanlan/watches/`。
+2. **先试运行**：`go run . --headless --task=watch-test -- <规则ID>`，看 `scenarios[].metrics` 里指标的真实取值、`matched` 是否命中。不命中先改阈值，别急着启用。
+3. **启用**：`watchdog.toggle`（或面板开关）。默认 `enabled=false`，模板生成的新规则一律先关着。
+4. **看日志**：`--task=watches` 看 `logs`，每条含时间、指标快照、Agent 结论、错误原因。
+5. **控噪**：命中太频繁就加 `cooldownSeconds`（模板里 600/900/1800 秒）或补 `quietWindows`（如 `09:25-09:35` 竞价噪声段）。全局每小时最多 6 次。
+
+**三个可直接抄的例子**：
+
+| 想盯什么 | 规则要点 |
+|---|---|
+| 半导体板块资金 | `sources: [{type:"sector", sector:"半导体", kind:"sector"}]`；`condition: "sector.mainNetYi > 20"`；`action.worker: "intraday"`，prompt 让它判断资金持续性 |
+| 某股放量突破 | `sources: [{type:"kline", codes:["600000"], period:"day"}]`；`condition: "kline.volumeRatio > 2 and kline.aboveMA20 > 0"`；prompt 让它区分真突破与诱多 |
+| 并购重组公告 | `sources: [{type:"news", keyword:"并购重组", kind:"notice"}]`；`condition: "news.hits > 0"`；`action.worker: "chat"`，prompt 让它列受益方向与待验证数据 |
+
+**边界**：条件只能读第 3.4 节列出的 22 个指标。想盯的东西如果不在白名单里（例如某个自定义指标），先提需求，不要试图在条件里写函数或运算表达式——解析器会直接拒绝（这也是它安全的原因）。
+
+**别做的事**：把规则当交易信号自动执行（本产品没有交易通道）；用 `schedule` 源在非交易时段刷 Agent（引擎本来就只在交易时段求值）；一次建 10 条以上规则（每小时触发上限会让你错过真正重要的那条）。
 
 ## 5. 模型配置
 
@@ -256,7 +310,7 @@ go run . --headless --task=selftest
 | 快捷键 | 动作 |
 |---|---|
 | `⌘K` / `Ctrl+K` | 聚焦全局搜索 |
-| `⌘1`…`⌘7` | 按顺序切换面板 |
+| `⌘1`…`⌘8` | 按顺序切换面板 |
 | `⌘J` / `Ctrl+J` | 打开/关闭 Agent 输出抽屉 |
 | `Esc` | 关闭抽屉 |
 
@@ -268,6 +322,8 @@ go run . --headless --task=selftest
 - **周期**：只支持日/周/月/60 分。`min15`/`min5`/`min1` 不支持，请求会明确报错。
 - **K 线主源**：东方财富的 K 线端点当前不可达，K 线以同花顺为主源；资金流与板块数据仍走东财。
 - **情绪指标**：涨停家数、炸板率、连板高度只有知识库口径（`theme-sentiment-cycle.md`），没有对应工具与面板。
+- **Watch 限制**：条件只能读 22 个白名单指标，不支持自定义指标与函数；非交易时段不求值。
+- **Watch 条件能力**：只能对 22 个白名单指标做数值比较，不支持自定义指标与函数；非交易时段不求值。
 - 没有实时 Level-2、没有逐笔委托，分钟级是上限。
 - 无云端同步：换机器要自己搬 `~/.guanlan`。
 - 只有一个主题（暗色）。

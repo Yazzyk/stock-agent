@@ -359,26 +359,36 @@ type kernelFixture struct {
 	audit *fakeAudit
 	guard *fakeGuard
 	store *fakeStore
+	dir   string // 临时 DataDir：插件落盘（如 watch 规则文件）只写这里
 }
 
-// newKernel 造一个可用 kernel：内存 Store、假 Guard、假 Audit、丢弃日志。
+// newKernel 造一个可用 kernel：内存 Store、假 Guard、假 Audit、丢弃日志、临时 DataDir。
 func newKernel(t *testing.T) *kernelFixture {
+	t.Helper()
+	return newKernelWithData(t, nil)
+}
+
+// newKernelWithData 在 newKernel 基础上注入 DataService（watch/quote 类插件需要）。
+func newKernelWithData(t *testing.T, data contract.DataService) *kernelFixture {
 	t.Helper()
 	store := newFakeStore()
 	guard := newFakeGuard()
 	audit := newFakeAudit()
+	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	k, err := kernel.New(kernel.Options{
 		Logger: logger,
 		Store:  store,
+		Data:   data,
 		Guard:  guard,
 		Audit:  audit,
 		Clock:  time.Now,
+		DataDir: dir,
 	})
 	if err != nil {
 		t.Fatalf("kernel.New 失败: %v", err)
 	}
-	return &kernelFixture{k: k, audit: audit, guard: guard, store: store}
+	return &kernelFixture{k: k, audit: audit, guard: guard, store: store, dir: dir}
 }
 
 func (f *kernelFixture) register(t *testing.T, ps ...plugin.Plugin) {

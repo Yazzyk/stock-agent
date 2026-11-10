@@ -240,13 +240,15 @@ func TestBusPublishSubscribe(t *testing.T) {
 		t.Fatal("2s 内未收到事件")
 	}
 
-	// 取消订阅后不再收到
+	// 取消订阅后不再收到。
+	// 这是"负向断言"：unsub 在返回前已持锁删除订阅者，随后的 Publish 在锁内复制订阅者列表，
+	// 因此这里不存在"订阅已删但 goroutine 还在路上"的竞态；等待窗口只是给调度留余量。
 	unsub()
 	bus.Publish(plugin.Event{Topic: "watch.updated"})
 	select {
 	case <-recv:
 		t.Fatal("取消订阅后不应再收到事件")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	// 通配订阅能收到任意 topic

@@ -22,6 +22,12 @@ import type {
   SyncResult,
   ToolView,
   WatchItem,
+  WatchMetricSpec,
+  WatchRule,
+  WatchRunLog,
+  WatchScenario,
+  WatchSource,
+  WatchTestResult,
   WorkerInfo,
 } from './types'
 
@@ -201,6 +207,33 @@ function tool(name: string, title: string, summary: string, tags: string[], risk
 }
 
 const PLUGINS: PluginView[] = [
+  {
+    id: 'watch',
+    name: 'Watch 哨兵',
+    version: '0.1.0',
+    description: '自定义盯盘规则：条件命中后自动派一次 Agent 任务，规则文件即插件',
+    active: true,
+    dependsOn: ['agentlab'],
+    tools: [
+      tool('watchdog.list', '列出 Watch 规则', '查看所有盯盘规则与开关状态', ['watch'], 'read'),
+      tool('watchdog.create', '创建 Watch 规则', '按描述创建盯盘规则（Agent 用）', ['watch'], 'write'),
+      tool('watchdog.toggle', '开关 Watch 规则', '启用或停用一条规则', ['watch'], 'write'),
+      tool('watchdog.test', '试运行 Watch 规则', '只求值不触发，返回场景与渲染后的 prompt', ['watch'], 'read'),
+      tool('watchdog.logs', 'Watch 触发日志', '最近的命中与派发记录', ['watch'], 'read'),
+    ],
+    ui: [{ id: 'watch', title: 'Watch 哨兵', group: '研究', component: 'watch', order: 35, owner: 'watch' }],
+    methods: [
+      { name: 'list', description: '规则/状态/指标/日志' },
+      { name: 'save', description: '新增或更新规则' },
+      { name: 'toggle', description: '开关规则' },
+      { name: 'remove', description: '删除规则' },
+      { name: 'test', description: '试运行' },
+      { name: 'logs', description: '触发日志' },
+      { name: 'templates', description: '规则模板' },
+      { name: 'metrics', description: '指标白名单' },
+      { name: 'state', description: '引擎状态' },
+    ],
+  },
   {
     id: 'watchlist',
     name: '自选股',
@@ -570,6 +603,8 @@ function reportOf(worker: string): string {
 async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   const id = 's-demo-' + Date.now().toString(36)
   stopped = false
+  const wantsWatchRule = /watchdog\.create/.test(input)
+  const createdRule = wantsWatchRule ? watchCreateFromDescription(input) : null
   emit('agent.state', { sessionId: id, state: 'thinking', detail: '准备上下文' })
   for (let i = 0; i < DELTA_STEPS.length; i++) {
     if (stopped) break
@@ -577,7 +612,11 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
     emit('agent.delta', { sessionId: id, text: DELTA_STEPS[i] ?? '' })
     if (i === 5) emit('agent.state', { sessionId: id, state: 'tool', detail: 'flow.stock' })
   }
-  const report = reportOf(worker)
+  const report = createdRule
+    ? '# 已创建 Watch 规则\n\n- 规则：' + createdRule.name + '\n- 触发源：' +
+      createdRule.sources.map((s) => (s.type === 'quote' || s.type === 'kline' ? s.type + ':' + (s.codes ?? []).join(',') : s.type === 'sector' ? '板块:' + (s.sector ?? '') : s.type === 'news' ? '新闻:' + (s.keyword ?? '') : '定时:' + (s.times ?? []).join(','))).join(' | ') +
+      '\n- 条件：`' + createdRule.condition + '`\n- 动作：' + createdRule.action.worker + '\n- 冷却：' + createdRule.cooldownSeconds + ' 秒\n\n> 规则已启用，可在面板里试运行或调参。\n'
+    : reportOf(worker)
   const usage = { promptTokens: 12480, completionTokens: 1860, totalTokens: 14340 }
   const session: AgentSession = {
     id,
@@ -593,6 +632,303 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   return { sessionId: id, worker, report, steps: 6, usage }
 }
 
+
+// ---------- Watch 哨兵演示数据 ----------
+
+const WATCH_METRICS: WatchMetricSpec[] = [
+  { name: 'flow.mainNet', label: '主力净额', unit: '元' },
+  { name: 'flow.mainNetPct', label: '主力净占比（净额/成交额）', unit: '%' },
+  { name: 'flow.mainNetYi', label: '主力净额', unit: '亿元' },
+  { name: 'kline.aboveMA20', label: '站上 MA20', unit: '1/0' },
+  { name: 'kline.atrPct', label: 'ATR 占收盘', unit: '%' },
+  { name: 'kline.ma20dev', label: '距 MA20', unit: '%' },
+  { name: 'kline.macd', label: 'MACD 柱', unit: '' },
+  { name: 'kline.rsi', label: 'RSI(14)', unit: '' },
+  { name: 'kline.volumeRatio', label: '量比(5日)', unit: '' },
+  { name: 'news.hits', label: '命中新闻/公告数', unit: '条' },
+  { name: 'news.negative', label: '负面词命中', unit: '1/0' },
+  { name: 'quote.amount', label: '成交额', unit: '元' },
+  { name: 'quote.changePct', label: '涨跌幅', unit: '%' },
+  { name: 'quote.price', label: '现价', unit: '元' },
+  { name: 'quote.turnover', label: '换手率', unit: '%' },
+  { name: 'quote.volumeRatio', label: '量比', unit: '' },
+  { name: 'sector.changePct', label: '板块涨跌幅', unit: '%' },
+  { name: 'sector.mainNet', label: '板块主力净额', unit: '元' },
+  { name: 'sector.mainNetYi', label: '板块主力净额', unit: '亿元' },
+  { name: 'time.hour', label: '小时', unit: '' },
+  { name: 'time.minute', label: '分钟', unit: '' },
+  { name: 'time.trading', label: '是否交易时段', unit: '1/0' },
+]
+
+const WATCH_TEMPLATES: WatchRule[] = [
+  {
+    name: '半导体板块资金异动',
+    description: '板块主力净流入占比超过 2% 时让 Agent 判断持续性',
+    enabled: true,
+    sources: [{ type: 'sector', sector: '半导体', kind: 'sector' }],
+    condition: 'sector.mainNetYi > 20',
+    action: {
+      worker: 'intraday',
+      prompt: '板块 {sector} 主力净流入 {sector.mainNetYi} 亿元，涨跌 {sector.changePct}%。请判断资金持续性，并给出 3 条观察要点（不构成投资建议）。',
+    },
+    cooldownSeconds: 600,
+    createdBy: 'template',
+  },
+  {
+    name: '自选股放量突破',
+    description: '量比 > 2 且站上 MA20 时触发',
+    enabled: false,
+    sources: [{ type: 'kline', codes: ['600519'], period: 'day' }],
+    condition: 'kline.volumeRatio > 2 and kline.aboveMA20 > 0',
+    action: {
+      worker: 'intraday',
+      prompt: '标的出现放量突破（量比 {kline.volumeRatio}，距 MA20 {kline.ma20dev}%），请结合形态判断是真突破还是诱多。',
+    },
+    cooldownSeconds: 900,
+    createdBy: 'template',
+  },
+  {
+    name: '公告关键词监控',
+    description: '公告出现关键词时让 Agent 做方向研究',
+    enabled: false,
+    sources: [{ type: 'news', keyword: '并购重组', kind: 'notice' }],
+    condition: 'news.hits > 0',
+    action: {
+      worker: 'chat',
+      prompt: '出现了 {news.hits} 条与「{keyword}」相关的公告/新闻（示例：{summary}）。请评估可能受益的方向与需要验证的数据。',
+    },
+    cooldownSeconds: 1800,
+    createdBy: 'template',
+  },
+]
+
+let watchRules: WatchRule[] = [
+  {
+    id: 'w7f3a1b2c4d5',
+    name: '自选放量突破',
+    description: '自选股量比放大且涨跌幅超过阈值时派给盯盘 worker',
+    enabled: true,
+    sources: [{ type: 'quote', codes: ['300750', '688981'] }],
+    condition: 'quote.changePct > 3 and quote.volumeRatio > 2',
+    action: {
+      worker: 'intraday',
+      prompt: '标的 {code} 出现放量拉升：涨跌幅 {quote.changePct}%，量比 {quote.volumeRatio}。请给出当日节奏判断与需要继续观察的信号（不构成投资建议）。',
+    },
+    cooldownSeconds: 600,
+    quietWindows: ['11:30-13:00'],
+    createdBy: 'user',
+    createdAt: '2026-11-08T09:12:00+08:00',
+    updatedAt: '2026-11-10T09:20:00+08:00',
+    lastTriggeredAt: '2026-11-10T10:32:00+08:00',
+    triggerCount: 2,
+  },
+  {
+    id: 'w2c9e8d7a6b5',
+    name: '半导体板块资金异动',
+    description: '板块主力净流入超过 20 亿时让 Agent 判断持续性',
+    enabled: false,
+    sources: [{ type: 'sector', sector: '半导体', kind: 'sector' }],
+    condition: 'sector.mainNetYi > 20 and sector.changePct > 1',
+    action: {
+      worker: 'chat',
+      prompt: '板块 {sector} 主力净流入 {sector.mainNetYi} 亿元，涨跌 {sector.changePct}%。请判断资金是否具有持续性，并列出 3 条验证要点。',
+    },
+    cooldownSeconds: 900,
+    quietWindows: [],
+    createdBy: 'user',
+    createdAt: '2026-11-06T15:40:00+08:00',
+    updatedAt: '2026-11-09T21:03:00+08:00',
+    triggerCount: 0,
+    lastError: '未配置模型：请在「模型设置」里填写 API Key 后重试',
+  },
+  {
+    id: 'w9d1f0a2b3c4',
+    name: '盘中定时巡检',
+    description: '交易时段的固定时点让 Agent 做一次盘面巡检',
+    enabled: true,
+    sources: [{ type: 'schedule', times: ['09:35', '13:05'] }],
+    condition: 'time.trading == 1',
+    action: {
+      worker: 'intraday',
+      prompt: '到了巡检时点：请汇总自选涨跌分布、板块资金前五与异动标的，给出 5 条观察要点。',
+    },
+    cooldownSeconds: 300,
+    quietWindows: ['11:30-13:00'],
+    createdBy: 'user',
+    createdAt: '2026-11-05T08:30:00+08:00',
+    updatedAt: '2026-11-10T09:00:00+08:00',
+    lastTriggeredAt: '2026-11-10T13:05:12+08:00',
+    triggerCount: 5,
+  },
+]
+
+const WATCH_LOGS: WatchRunLog[] = [
+  {
+    time: '2026-11-10T10:32:00+08:00',
+    ruleId: 'w7f3a1b2c4d5',
+    ruleName: '自选放量突破',
+    worker: 'intraday',
+    triggered: true,
+    matched: true,
+    summary: '300750 涨 3.47%，量比 2.13',
+    metrics: { 'quote.changePct': 3.47, 'quote.volumeRatio': 2.13, 'quote.price': 246.18 },
+    report: '300750 宁德时代放量突破前高，量比 2.13，主力净流入 1.42 亿。\n\n观察要点：\n1. 回踩 240 是否缩量\n2. 板块资金是否延续\n3. 若跌破 MA10（232.6）需降低预期',
+    elapsedMs: 3120,
+  },
+  {
+    time: '2026-11-10T09:35:04+08:00',
+    ruleId: 'w9d1f0a2b3c4',
+    ruleName: '盘中定时巡检',
+    worker: 'intraday',
+    triggered: true,
+    matched: true,
+    summary: '定时巡检：自选 12 只，8 涨 4 跌',
+    metrics: { 'time.trading': 1 },
+    report: '巡检结果：自选 12 只中 8 涨 4 跌，半导体与电池资金流入居前；601318 跌破 MA10。',
+    elapsedMs: 6420,
+  },
+  {
+    time: '2026-11-10T10:20:31+08:00',
+    ruleId: 'w2c9e8d7a6b5',
+    ruleName: '半导体板块资金异动',
+    worker: 'chat',
+    triggered: false,
+    matched: true,
+    error: '触发未派发：冷却中（600 秒内只派发一次）',
+  },
+]
+
+function renderWatchPrompt(tpl: string, metrics: Record<string, number>, ctx: Record<string, string>): string {
+  return tpl.replace(/\{([a-zA-Z0-9_.]+)\}/g, (whole, key: string) => {
+    if (ctx[key] !== undefined) return ctx[key]
+    const v = metrics[key]
+    return v === undefined ? whole : String(v)
+  })
+}
+
+function watchScenarioMetrics(code: string, name: string): Record<string, number> {
+  const rand = rng(seedOf(code))
+  return {
+    'quote.price': round2(12 + rand() * 260),
+    'quote.changePct': round2((rand() - 0.3) * 6),
+    'quote.volumeRatio': round2(0.6 + rand() * 2.4),
+    'quote.turnover': round2(rand() * 4),
+    'kline.rsi': round2(38 + rand() * 32),
+    'kline.ma20dev': round2((rand() - 0.4) * 8),
+    'kline.volumeRatio': round2(0.7 + rand() * 2.2),
+    'kline.aboveMA20': rand() > 0.35 ? 1 : 0,
+    'flow.mainNetYi': round2((rand() - 0.4) * 8),
+    'flow.mainNetPct': round2((rand() - 0.4) * 12),
+    'time.trading': 1,
+  }
+}
+
+function watchTestMock(id: string): WatchTestResult {
+  const rule = watchRules.find((r) => r.id === id) ?? watchRules[0]
+  const metrics: Record<string, number> = {}
+  const scenarios: WatchScenario[] = []
+  const codes: string[] = []
+  for (const s of rule?.sources ?? []) {
+    if (s.type === 'quote' || s.type === 'kline') for (const c of s.codes ?? []) codes.push(c)
+  }
+  if (codes.length === 0) {
+    const sector = (rule?.sources ?? []).find((s) => s.type === 'sector')?.sector
+    if (sector) {
+      metrics['sector.changePct'] = 3.62
+      metrics['sector.mainNetYi'] = 48.2
+      metrics['sector.mainNet'] = 4.82e9
+      metrics['news.hits'] = 0
+      metrics['time.trading'] = 1
+      scenarios.push({ sector, name: sector, metrics: { ...metrics }, matched: true })
+    } else {
+      metrics['time.trading'] = 1
+      metrics['news.hits'] = 2
+      scenarios.push({ name: '定时/新闻场景', metrics: { ...metrics }, matched: true })
+    }
+  } else {
+    codes.forEach((code, i) => {
+      const name = DEMO_STOCKS.find((s) => s.code === code)?.name ?? code
+      const m = watchScenarioMetrics(code, name)
+      // 首条场景刻意构造成"放量突破"形态，避免出现「命中但数值不满足阈值」的演示矛盾
+      if (i === 0) {
+        m['quote.changePct'] = 3.47
+        m['quote.volumeRatio'] = 2.13
+        m['kline.volumeRatio'] = 2.13
+        m['kline.aboveMA20'] = 1
+      }
+      for (const k of Object.keys(m)) metrics[k] = m[k] ?? 0
+      scenarios.push({
+        code,
+        name,
+        metrics: m,
+        matched: i === 0,
+      })
+    })
+  }
+  const first = scenarios[0]
+  if (first) for (const k of Object.keys(first.metrics)) metrics[k] = first.metrics[k] ?? 0
+  const summary = scenarios.length > 0
+    ? scenarios
+        .map((s) => (s.code ? s.code + ' ' + s.name : s.sector ?? s.name ?? '') + '：' + (s.matched ? '命中' : '未命中'))
+        .join('；')
+    : '没有可求值的场景'
+  const prompt = renderWatchPrompt(rule?.action.prompt ?? '', metrics, {
+    code: first?.code ?? '',
+    name: first?.name ?? '',
+    sector: first?.sector ?? '',
+    summary,
+    keyword: (rule?.sources ?? []).find((s) => s.type === 'news')?.keyword ?? '',
+  })
+  return {
+    ruleId: rule?.id ?? id,
+    matched: scenarios.some((s) => s.matched),
+    scenarios,
+    summary,
+    prompt,
+    elapsedMs: 780,
+  }
+}
+
+/** Agent 一句话创建规则：从描述里抽代码/关键词，拼一条能直接跑的规则。 */
+function watchCreateFromDescription(text: string): WatchRule {
+  const body = text.replace(/^.*watchdog\.create[^：:]*[：:]?/, '').trim() || text
+  const codes = (body.match(/\b\d{6}\b/g) ?? []).slice(0, 3)
+  const wantsSector = /板块|概念|行业/.test(body)
+  const wantsNews = /公告|新闻|消息/.test(body)
+  const wantsTime = /每天|盘中|定时|开盘|收盘/.test(body)
+  const rule: WatchRule = {
+    id: 'w' + Date.now().toString(36),
+    name: body.slice(0, 28) || 'Agent 生成的规则',
+    description: '由 Agent 根据一句话描述创建',
+    enabled: true,
+    sources: wantsSector
+      ? [{ type: 'sector', sector: /半导体/.test(body) ? '半导体' : 'AI 算力', kind: 'sector' }]
+      : wantsNews
+        ? [{ type: 'news', keyword: /并购/.test(body) ? '并购重组' : '回购', kind: 'notice' }]
+        : wantsTime
+          ? [{ type: 'schedule', times: ['09:35', '13:05'] }]
+          : [{ type: 'quote', codes: codes.length > 0 ? codes : ['600519'] }],
+    condition: wantsSector
+      ? 'sector.changePct > 2 and sector.mainNetYi > 10'
+      : wantsNews
+        ? 'news.hits > 0'
+        : wantsTime
+          ? 'time.trading == 1'
+          : 'quote.changePct > 3 and quote.volumeRatio > 2',
+    action: {
+      worker: 'intraday',
+      prompt: '触发信号：{summary}。请结合行情与资金面给出简短判断和观察要点（不构成投资建议）。',
+    },
+    cooldownSeconds: 600,
+    quietWindows: ['11:30-13:00'],
+    createdBy: 'agent',
+    createdAt: nowISO(),
+    updatedAt: nowISO(),
+    triggerCount: 0,
+  }
+  watchRules = [rule, ...watchRules]
+  return rule
+}
 
 // ---------- 量化研究演示数据 ----------
 
@@ -968,9 +1304,10 @@ export function createMockBridge(): GoBridge {
     started: true,
     plugins: PLUGINS.length,
     active: PLUGINS.length,
-    tools: PLUGINS.reduce((n, p) => n + p.tools.length, 0),
+    // 与真实后端一致：8 个插件共 27 个工具（演示桥只登记参与 UI 的一部分）
+    tools: 27,
     ui: PLUGINS.length,
-    services: ['agent.runtime', 'kb.store', 'kline.engine', 'quant.engine'],
+    services: ['agent.runtime', 'kb.store', 'kline.engine', 'llm', 'quant.engine', 'watch.engine'],
     policy: {
       networkAllowlist: ['push2.eastmoney.com', 'd.10jqka.com.cn', 'qt.gtimg.cn', 'hq.sinajs.cn'],
       pathRoots: ['~/.guanlan'],
@@ -1155,6 +1492,47 @@ export function createMockBridge(): GoBridge {
           if (idx >= 0) models.splice(idx, 1)
           out = { providers: models, defaultId: models.find((m) => m.isDefault)?.id ?? '' }
         } else throw new Error('kernel: 方法不存在 ' + method)
+      } else if (plugin === 'watch') {
+        if (method === 'list') out = { rules: watchRules, running: true, metrics: WATCH_METRICS, logs: WATCH_LOGS }
+        else if (method === 'metrics') out = { metrics: WATCH_METRICS }
+        else if (method === 'state') out = { running: true, rules: watchRules.length }
+        else if (method === 'templates') out = { templates: WATCH_TEMPLATES, metrics: WATCH_METRICS }
+        else if (method === 'logs') out = { logs: WATCH_LOGS.slice(0, typeof p.limit === 'number' ? p.limit : 50) }
+        else if (method === 'save') {
+          const raw = p as Record<string, unknown>
+          const rule: WatchRule = {
+            id: typeof raw.id === 'string' && raw.id !== '' ? raw.id : 'w' + Date.now().toString(36),
+            name: String(raw.name ?? '未命名规则'),
+            description: raw.description ? String(raw.description) : undefined,
+            enabled: raw.enabled === true,
+            sources: Array.isArray(raw.sources) ? (raw.sources as WatchSource[]) : [],
+            condition: String(raw.condition ?? 'true'),
+            action: {
+              worker: String((raw.action as Record<string, unknown> | undefined)?.worker ?? 'intraday'),
+              prompt: String((raw.action as Record<string, unknown> | undefined)?.prompt ?? ''),
+            },
+            cooldownSeconds: typeof raw.cooldownSeconds === 'number' ? raw.cooldownSeconds : 300,
+            quietWindows: Array.isArray(raw.quietWindows) ? (raw.quietWindows as string[]) : [],
+            createdBy: 'user',
+            createdAt: nowISO(),
+            updatedAt: nowISO(),
+          }
+          const idx = watchRules.findIndex((r) => r.id === rule.id)
+          if (idx >= 0) watchRules[idx] = { ...watchRules[idx], ...rule }
+          else watchRules = [rule, ...watchRules]
+          out = { rule, rules: watchRules }
+        } else if (method === 'toggle') {
+          const id = String(p.id ?? '')
+          const enabled = p.enabled === true
+          watchRules = watchRules.map((r) => (r.id === id ? { ...r, enabled } : r))
+          out = { rule: watchRules.find((r) => r.id === id) ?? watchRules[0] }
+        } else if (method === 'remove') {
+          const id = String(p.id ?? '')
+          watchRules = watchRules.filter((r) => r.id !== id)
+          out = { rules: watchRules }
+        } else if (method === 'test') {
+          out = watchTestMock(String(p.id ?? watchRules[0]?.id ?? ''))
+        } else throw new Error('kernel: 方法不存在 ' + method)
       } else if (plugin === 'quant') {
         const code = String(p.code ?? '600519')
         const strategy = String(p.strategy ?? 'ma')
@@ -1205,6 +1583,7 @@ export function createMockBridge(): GoBridge {
           }))
           out = { hits: hits.length > 0 ? hits : DOC_SUMMARIES.map((d, i) => ({ id: d.id + ':1', docId: d.id, title: d.title, snippet: d.summary, score: round2(0.86 - i * 0.06) })) }
         } else if (method === 'open') out = DOC_CONTENT[String(p.id ?? 'doc-ma')] ?? DOC_CONTENT['doc-ma']
+        else if (method === 'import') out = { id: 'doc-demo', title: String(p.title ?? '演示导入'), chars: String(p.content ?? '').length }
         else if (method === 'skills') out = { skills: SKILLS.map((s) => ({ name: s.name, description: s.description, tags: [] })) }
         else if (method === 'skill') {
           const found = SKILLS.find((s) => s.name === String(p.name ?? '')) ?? SKILLS[0]

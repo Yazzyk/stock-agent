@@ -10,5 +10,6 @@ import (
 	_ "github.com/yazzyk/stock-agent/plugins/knowledge"
 	_ "github.com/yazzyk/stock-agent/plugins/modelsettings"
 	_ "github.com/yazzyk/stock-agent/plugins/quant"
+	_ "github.com/yazzyk/stock-agent/plugins/watch"
 	_ "github.com/yazzyk/stock-agent/plugins/watchlist"
 )

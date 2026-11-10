@@ -378,6 +378,8 @@ type Context struct {
 	Manifest Manifest
 	Log      *slog.Logger
 	Clock    func() time.Time
+	// DataDir 是本应用的本地数据根目录（~/.guanlan），插件落盘必须限制在其中。
+	DataDir string
 
 	Tools    *ToolRegistry
 	ToolHost ToolHost

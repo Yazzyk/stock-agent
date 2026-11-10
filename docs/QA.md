@@ -1,7 +1,7 @@
 # 质量与验收报告（QA）
 
 维护：qa · 判定标准来源：`docs/ACCEPTANCE.md`（R1–R9）、`docs/PLAN.md`（所有权/红线）、`docs/DOMAIN.md`（口径）
-最近更新：2026-11-10 22:35（Asia/Shanghai）· 状态：**终态验收（PASS 8 / FAIL 0 / BLOCKED 1，BLOCKED 仅因 QA 环境无 API Key）**
+最近更新：2026-11-10 22:55（Asia/Shanghai）· 状态：**终态验收 R1–R10（PASS 9 / FAIL 0 / BLOCKED 1，BLOCKED 仅因 QA 环境无 API Key）**
 
 > 只记录实测。三态沿用 ACCEPTANCE §0：PASS / FAIL / BLOCKED，不写"部分通过"。
 > 所有命令都在仓库根目录执行；`~/.guanlan` 是真实数据目录，QA 的 live 测试用**临时目录**跑，不污染它。
@@ -16,7 +16,7 @@
 | `scripts/verify.sh --with-network` | 追加联网数据链路断言（bars 至少 10 根 + close 字段） | 同上 |
 | `scripts/verify.sh --with-race` | 追加 `go test -race ./...` | 同上 |
 | `scripts/verify.sh --with-wails` | 追加 `wails build -clean`（会删 dist，仅集成用） | 同上 |
-| `scripts/verify.sh --expect-plugins=N` | 插件装配数下限，默认 **7**；交付中期可传 0 关闭 | 同上 |
+| `scripts/verify.sh --expect-plugins=N` | 插件装配数下限，默认 **8**（watchlist/fundflow/kline/agentlab/knowledge/modelsettings/quant/watch）；工具索引下限常量 `EXPECT_TOOLS=27`；都可传 0 关闭 | 同上 |
 | `scripts/smoke.sh` | 5 个行情端点形状断言 + 东财 K 线主机探测；失败只 WARN | 恒 0（网络问题不判死） |
 | `go test ./test/ -count=1` | 外部契约/不变量测试（63 个测试函数 / 145 个用例） | go test 语义 |
 | `go test -tags live ./test/ -run TestLive -v` | 端到端联网验收（临时数据目录，验证 R3/R6/R7/R8 的真实链路） | go test 语义 |
@@ -40,16 +40,18 @@
 | 条目 | 归属 | 结果 | 证据命令 | 实测 |
 |---|---|---|---|---|
 | R1 删除教学代码与引用 | lead | **PASS** | `test ! -d cmd/mini`；`grep -rn "cmd/mini" --include=*.go .`；`go build ./...` | 无 `cmd/mini`；引用 0；`go build ./...` exit 0 |
-| R2 插件契约与 kernel 运行时 | lead | **PASS** | `go test ./internal/kernel/`；`go run . --headless --task=selftest` | kernel 单测 `ok`；selftest：**插件 7 个 / 激活 7 个 / 工具 22 个 / 面板 7 个 / 结果 OK**；服务 `agent.runtime, kb.store, kline.engine, llm, quant.engine`；QA 另有 36 个 kernel 契约用例（见第 3 节） |
+| R2 插件契约与 kernel 运行时 | lead | **PASS** | `go test ./internal/kernel/`；`go run . --headless --task=selftest` | kernel 单测 `ok`；selftest：**插件 8 个 / 激活 8 个 / 工具 27 个 / 面板 8 个 / 结果 OK**；服务 `agent.runtime, kb.store, kline.engine, llm, quant.engine, watch.engine`；QA 另有 36 个 kernel 契约用例（见第 3 节） |
 | R3 数据层与存储 | backend-data | **PASS**（附 2 条口径缺口） | `--task=quote -- 600000`；`--task=bars -- 600000 day 60`；`go test -tags live ./test/ -run TestLiveEndToEnd`；`./scripts/smoke.sh` | quote：`{"code":"600000","name":"浦发银行","market":"sh","price":10.2,"prevClose":10.1,"changePct":0.99,"source":"ths"}`；bars 60 根日期严格递增、close>0；live E2E：60/60 根、source=ths；smoke 5/5 PASS。缺口：**qfq/hfq 不可用（东财 kline 端点不可达）→ 显式降级 `adjust=none` + warning；min15/5/1 周期不支持**（见第 5 节） |
 | R4 回测引擎与策略 | backend-data | **PASS（引擎/不变量）/ BLOCKED（quant 报告需模型）** | `go test ./internal/backtest/ -count=1`；`go test ./test/ -run TestBacktest`；`go run . --headless --task=quant` | 引擎 11 个用例全绿（含 T+1、涨跌停、停牌、成本、walk-forward、样本内外）；QA 另有 3 条独立不变量（无未来函数/成本单调/MDD 口径）全绿。`--task=quant` 走 agentlab worker，本机 `Models()` 无 key → `未配置模型：请在"模型设置"里填写 API Key 后再运行`，报告生成 BLOCKED |
 | R5 Agent harness | backend-core | **BLOCKED（QA 环境缺 key）** | `go run . --headless --task=premarket`；`go test -tags live ./test/ -run TestAgent`（离线 fake LLM） | 本机 selftest 显示 `deepseek/deepseek-chat key=false` → premarket fast-fail（符合设计，0 次模型调用、<2s）。lead 侧用真 key 已跑通 8 步 ReAct 并落 plan.md。QA 侧以 fake LLM 覆盖循环不变量：工具结果回填（含 ToolCallID）、步数上限、token 预算、猜错工具名不中断、无模型快速失败，全部 PASS |
 | R6 渐进式披露（工具/技能/知识库） | backend-core | **PASS** | `--task=tools`；`--task=skill.list`；`go test -tags live ./test/ -run 'TestLiveEndToEnd|TestLiveToolSummaries'` | 工具 22 个（≥12 ✓）、风险只出现 read/network/write（无 exec ✓）、**全部 summary ≤40 字**（D9 修复后复跑 TestLiveToolSummaries PASS）；技能 6 个（premarket-plan/postmarket-review/intraday-monitor/kline-reading/fundflow-reading/quant-honesty）✓；kb.search 真实命中 `题材与情绪周期 score=6.3602`（标题+片段+分数 ✓）；L1 预算/describe/技能越界/KB top1 稳定性见第 3 节 |
-| R7 自选股同步 | backend-data + watchlist | **PASS** | `go run . --headless --task=watchlist`；`go test -tags live ./test/ -run TestLiveWatchlist -v` | 163 条、20 个分组，code/name/market/group/order 齐全且名称为可读中文（`上海九百`/`冰山冷热`/`大业股份`…），无凭证泄露、不 panic；条目 `source=ths-local`（实测，见 D13）。D10 的 GBK 乱码已由 backend-data 修复（`TestLiveWatchlist` PASS，badNames=0） |
+| R7 自选股同步 | backend-data + watchlist | **PASS** | `go run . --headless --task=watchlist`；`go test -tags live ./test/ -run TestLiveWatchlist -v` | 163 条、20 个分组，code/name/market/group/order 齐全且名称为可读中文（`上海九百`/`冰山冷热`/`大业股份`…），无凭证泄露、不 panic；条目 `source=ths-local`（与同步来源同名，D13 已定稿）。D10 的 GBK 乱码已由 backend-data 修复（`TestLiveWatchlist` PASS，badNames=0） |
 | R8 资金流与 K 线面板 | backend-data + frontend | **PASS** | `--task=flow.rank`；`--task=sector.list`；`cd frontend && npm run build` | flow.rank：电子 主力净额 `9201537792`（元，9.2e9 落在 1e7–1e11 区间 ✓）；sector.list：100 条含 changePct/mainNet；前端 `vue-tsc --noEmit && vite build` PASS（verify.sh 实测约 2s） |
 | R9 安全与一键验收 | lead + qa | **PASS** | `selftest | grep -E "sk-|Bearer |token="`；`tools | grep -c "\[exec\]"`；`verify.sh`；`go test -race ./...` | 密钥特征 **0**；exec 工具 **0**；`verify.sh --with-network --with-race` **10/10 PASS**；`-race` 18 个包全绿无 DATA RACE；落盘仅在 `~/.guanlan`（DB/审计/会话/知识库）；`wails build -clean` 由 lead 跑通（build/bin/guanlan.app） |
 
-**汇总：PASS 8（R1 R2 R3 R4-引擎 R6 R7 R8 R9）· FAIL 0 · BLOCKED 1（R5，仅因 QA 环境无 API Key）**
+| R10 Watch 哨兵（第 8 插件） | backend-core + qa | **PASS** | `--task=watches`；`--task=watch-test -- <id>`；`go test ./test/ -run TestWatch` | ① **规则可创建/可开关**：方法链路 save→toggle(true)→toggle(false)→remove 全通，规则文件落 `<DataDir>/watches/<id>.json` 且删除时同步清理；② **试运行返回 metrics 且 matched 与条件一致**：条件 `quote.price > 10`（fake 现价 10.2）→ matched=true、metrics 含 `quote.price=10.2`；把条件改成 `> 100` → matched=false；headless 实测 `--task=watch-test -- w68aaf120f8f8` matched=true，metrics `sector.mainNet=4062413312`/`sector.changePct=2.97`；③ **文件改动 5s 内生效**：引擎 Tick=100ms 下改 `watches/*.json`，5s 内 `Get` 看到新 condition（实测 0.2s）；④ **DSL 无法执行代码**：`exec("rm -rf /")`、`os.system("rm")`、`import os`、`quote["price"]`、`eval(1)`、`quote.price > 1; rm -rf /`、反引号与 `__import__` 共 10 种写法全部解析失败，`Rule.Validate` 拒绝非白名单指标（`quote.foo`/`quote.constructor`/`window.location`/`process.env`）；⑤ **装配契约**：缺 `agent.runtime` 时 watch 激活失败且错误指向该服务与 agentlab；⑥ **默认关闭**：新建不传 `enabled` → false，tick 500ms 内零触发；显式 toggle 后才触发（RunLog triggered+matched） |
+
+**汇总：PASS 9（R1 R2 R3 R4-引擎 R6 R7 R8 R9 R10）· FAIL 0 · BLOCKED 1（R5，仅因 QA 环境无 API Key）**
 
 > R4 的双重标注：引擎与不变量已 PASS；`--task=quant` 的报告生成依赖模型，本机无 key 记 BLOCKED。
 > R6 的 D9（tool.call 摘要 43 字）已由 backend-core 修到 37 字、R7 的 D10（名称 GBK 乱码）已由 backend-data 修好，QA 均复跑确认 PASS。
@@ -63,19 +65,34 @@
 
 ```text
 结果     耗时  步骤                           备注
-PASS        0.79s  go build ./...                   全仓库编译
-PASS        0.33s  go vet ./...                     静态检查（含测试代码）
-PASS        0.31s  go vet -tags live ./test/        live 测试的静态检查
-PASS        1.36s  go test ./... -count=1           全部单元/契约测试
-PASS        4.37s  go test -race ./... -count=1     数据竞争检测（较慢）
-PASS        1.92s  frontend: npm run build          vue-tsc 类型检查 + vite 构建
-PASS        1.07s  headless: selftest               插件必须全部激活
-PASS        0.35s  headless: 插件装配数        断言 ≥ 7（0=关闭）
-PASS        0.35s  network: 数据链路（bars）  联网；断言 ≥10 根 + close 字段
-PASS        0.15s  headless: 工具索引           断言：至少 1 个工具且带风险等级
+PASS        1.78s  go build ./...                   全仓库编译
+PASS        0.28s  go vet ./...                     静态检查（含测试代码）
+PASS        0.20s  go vet -tags live ./test/        live 测试的静态检查
+PASS        2.19s  go test ./... -count=1           全部单元/契约测试
+PASS        2.10s  frontend: npm run build          vue-tsc 类型检查 + vite 构建
+PASS        0.93s  headless: selftest               插件必须全部激活
+PASS        0.32s  headless: 插件装配数        断言 ≥ 8（0=关闭）
+PASS        0.16s  headless: 工具索引           断言 ≥ 27 个工具且带风险等级（0=只查非空）
 
-总计 10 步：PASS 10，FAIL 0；总耗时 11.01s
+总计 8 步：PASS 8，FAIL 0；总耗时 7.95s
 结论: PASS
+```
+
+（加 `--with-race` 与 `--with-network` 时共 10 步，实测亦为 10/10 PASS。）
+
+### 2.1b Watch 哨兵（R10）真机输出
+
+```text
+$ go run . --headless --task=watches        # 规则 + 指标白名单 + 日志
+{ "logs": [], "metrics": [ {"name":"flow.mainNet","label":"主力净额","unit":"元"}, … ] }
+
+$ go run . --headless --task=watch-test -- w68aaf120f8f8
+{
+  "elapsedMs": 218, "matched": true, "ruleId": "w68aaf120f8f8",
+  "scenarios": [ { "matched": true, "sector": "半导体",
+    "metrics": {"sector.changePct": 2.97, "sector.mainNet": 4062413312, "sector.mainNetYi": 40.62, "time.hour": 22} } ],
+  "summary": "板块 半导体 命中：涨跌 2.97%、主力净额 40.62 亿"
+}
 ```
 
 （不带开关时默认 8 步：去掉 `-race` 与联网数据链路；`--skip-frontend` 会把前端步骤记为 SKIP 而不是 PASS。）
@@ -131,8 +148,8 @@ WARN  东财 K线 https        两个主机均失败: push2his curl=52; push2 cu
 ### 2.5 规模
 
 ```text
-仓库测试函数总数（go test ./... -list）：305
-QA 外部测试包 test/：63 个测试函数 / 145 个用例
+仓库测试函数总数（go test ./... -list）：324
+QA 外部测试包 test/：70 个测试函数 / 162 个用例
 QA 文档：本文件 + test/testdata/README.md（夹具口径）
 ```
 
@@ -156,7 +173,8 @@ QA 文档：本文件 + test/testdata/README.md（夹具口径）
 | `backtest_test.go` | 回测无未来函数（篡改未来 K 线，历史净值逐位相同）、成本单调性（佣金×10/滑点×5）、MDD 口径一致、单调上涨只允许成本级回撤、数据不足给 Warnings | 3 / 3 |
 | `agent_test.go` | fake LLM 注入：工具结果回填（tool 消息含 ToolCallID + 工具输出）、步数上限（N=3 → 模型 3 次、执行 2 次，末轮请求不执行）、token 预算（50/每次 40 → 2 次后停）、猜错工具名不中断并回"改用 tool.call"提示、无模型快速失败 | 5 / 5 |
 | `fixtures_test.go` | 真实响应夹具的**口径**：THS JSONP 信封 + 140 根 + 日期递增 + OHLC 自洽；东财 bkzj f62 单位是元（电子 92.02 亿）；**资金流分档 f52=f55+f56、四档相消**；**新浪 r0~r3 是成交额、净额=in-out**；腾讯 GBK 解码=浦发银行、量单位手；**跨源一致**（三源收盘价相同、腾讯手×100≈THS/新浪股） | 6 / 6 |
-| `e2e_live_test.go`（`-tags live`） | 整链装配（临时数据目录）：工具 22 个/无 exec/元工具、kb 真实命中、quote/bars/flow 真实数据断言、自选结构与名称质量、审计落库；工具 summary ≤40 独立成条 | 3 / 3 |
+| `watch_test.go` | **Watch 哨兵（第 8 插件）**：条件 DSL 安全边界（10 种代码注入写法必须解析失败）、非白名单指标被 Rule.Validate 拒绝、指标白名单有序且模板规则自校验、缺 `agent.runtime` 时激活失败/有服务时激活并贡献 5 工具+面板 order=35+watch.engine、方法链路 save→list→toggle(true/false)→test（matched 与条件一致，含反证）→logs→remove（文件同步删除）、规则文件落在 DataDir/watches、热加载 5s 内生效、**默认关闭的规则 tick 不触发**（显式开启后才触发并落 RunLog） | 7 / 17 |
+| `e2e_live_test.go`（`-tags live`） | 整链装配（临时数据目录）：工具 27 个/无 exec/元工具、kb 真实命中、quote/bars/flow 真实数据断言、自选结构与名称质量、审计落库；工具 summary ≤40 独立成条 | 3 / 3 |
 
 设计原则：**只读产品代码**；断言语义（数值/顺序/字段/错误文本），不写"不 panic"式空断言；失败信息带期望/实际/索引/日期，可直接贴给 owner。
 
@@ -194,8 +212,10 @@ QA 文档：本文件 + test/testdata/README.md（夹具口径）
 | D8 | 回测 `MaxDrawdown` 是 `round4`（报告按百分比 2 位）；QA 复核口径 = 报告值等于 `round4(按净值曲线算出的回撤)` | `test/backtest_test.go` |
 | D11 | 新浪 `r0~r3` 是「买+卖」成交额（`r0 = r0_in + r0_out`），净额必须 `rN_in - rN_out`；`PLAN.md` §4 写的"净额"不准确 | `test/testdata/README.md`；`test/fixtures_test.go` |
 | D12 | 成交量单位：THS realhead / 新浪个股 / 新浪 K 线 = **股**；腾讯 = **手**；新浪指数 = **手**。`contract.Quote.Volume` 对外是**手** | `test/fixtures_test.go` 跨源断言（手×100 ≈ 股） |
-| D13 | **已拍板（lead, 2026-11-10）**：① `Quote.Time` 保持 RFC3339 `2026-11-10T15:30:00+08:00`（`docs/API.md` §0 冻结，改文档不改实现）；② `SyncResult.Source`=`ths-local` 表示**本次同步来源**。**实测差异（已回报 lead）**：`WatchItem.Source` 在实现里也是 `ths-local`（163/163），与 lead 口径里"条目来源=ths"不符；QA 断言按实测 + ACCEPTANCE R7 示例取 `ths-local` | `docs/QA.md` 本行；QA 断言：快照时间只校验非空，自选条目 source 断言 `ths-local` |
+| D13 | **已定稿（lead, 2026-11-10 22:50）**：① `Quote.Time` 保持 RFC3339 `2026-11-10T15:30:00+08:00`（`docs/API.md` §0 冻结，改文档不改实现）；② **条目来源与同步来源统一为 `ths-local`**（同一份本机同花顺来源，不造两个词）：`WatchItem.Source = ths-local`、`SyncResult.Source = ths-local` | QA 断言：快照时间只校验非空；自选条目与同步来源都断言 `ths-local`（`TestLiveWatchlist`） |
 | D14 | ReAct 步数口径：`Policy.MaxToolCalls` 是**模型轮次上限**；到达上限的那一轮工具请求不再执行（N 轮 = N-1 次工具执行） | `test/agent_test.go` 钉死 |
+| D15 | **Watch 规则默认关闭**（lead 定稿，安全优先）：规则会真的触发模型调用（花 token），`Save` 不替调用方启用；面板"保存并启用"与 Agent 生成规则都要显式传 `enabled:true`。默认关闭时 tick 直接跳过 | `test/watch_test.go`：新建断言 false、toggle 后 true、关闭态 500ms 零触发 |
+| D16 | **工具数最终结论 27**（8 插件）：`selftest` 首行与 `--task=tools` 有效行数两处一致，定稿。lead 曾报 28 是计数口径差异——`watchdog.remove` 是**方法**不是工具，不占工具位。`verify.sh` 的 `EXPECT_TOOLS=27` 定稿（新增工具时同步上调） | `scripts/verify.sh` 常量 + 本行；`go run . --headless --task=selftest` 首行 |
 
 ---
 

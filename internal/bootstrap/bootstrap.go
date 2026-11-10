@@ -90,13 +90,14 @@ func New(cfg Config, logger *slog.Logger) (*kernel.Kernel, error) {
 	}
 
 	k, err := kernel.New(kernel.Options{
-		Logger: logger,
-		Store:  store,
-		Data:   data,
-		LLM:    llmSvc,
-		Guard:  guard,
-		Audit:  audit,
-		Clock:  time.Now,
+		Logger:  logger,
+		Store:   store,
+		Data:    data,
+		LLM:     llmSvc,
+		Guard:   guard,
+		Audit:   audit,
+		Clock:   time.Now,
+		DataDir: cfg.DataDir,
 	})
 	if err != nil {
 		return nil, err
@@ -125,10 +126,10 @@ func envOr(key, def string) string {
 // 拆分交付期间由 stubs.go 提供过渡实现，保证主程序随时可编译可运行。
 // 五个接线点：由 bootstrap 独占，其它包不感知具体实现。
 var (
-	openStoreFn      func(Config, *slog.Logger) (contract.Store, error)                 = stubOpenStore
-	newGuardFn       func(Config, contract.Store, *slog.Logger) contract.Guard          = stubNewGuard
-	newAuditFn       func(contract.Store, *slog.Logger) contract.Audit                  = stubNewAudit
-	newDataServiceFn func(Config, contract.Store, contract.Guard, *slog.Logger) contract.DataService = stubNewDataService
+	openStoreFn      func(Config, *slog.Logger) (contract.Store, error)                                      = stubOpenStore
+	newGuardFn       func(Config, contract.Store, *slog.Logger) contract.Guard                               = stubNewGuard
+	newAuditFn       func(contract.Store, *slog.Logger) contract.Audit                                       = stubNewAudit
+	newDataServiceFn func(Config, contract.Store, contract.Guard, *slog.Logger) contract.DataService         = stubNewDataService
 	newLLMServiceFn  func(Config, contract.Store, contract.Guard, *slog.Logger) (contract.LLMService, error) = realNewLLMService
 )
 
