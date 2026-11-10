@@ -329,6 +329,7 @@ type reactState struct {
 	promptTok   int
 	complTok    int
 	totalTok    int
+	steers      int
 	maxSteps    int
 	maxTokens   int
 	exhausted   bool
@@ -345,6 +346,9 @@ type reactConfig struct {
 	MaxOutputTokens int
 	Temperature     *float64
 	OnDelta         func(string)
+	// DrainSteers 在每次模型调用前调用：返回用户中途插话（返回后队列清空）。
+	// 为空表示不支持插话，行为与未实现插话前完全一致。
+	DrainSteers func() []string
 }
 
 // ReactResult 是一次 ReAct 运行的产物。
@@ -355,6 +359,7 @@ type ReactResult struct {
 	Tokens           int
 	PromptTokens     int
 	CompletionTokens int
+	Steers           int
 	Exhausted        bool
 	Note             string
 	Transcript       []*schema.Message
@@ -382,6 +387,12 @@ func usageTotal(u *schema.TokenUsage) int {
 		return u.TotalTokens
 	}
 	return u.PromptTokens + u.CompletionTokens
+}
+
+// steerMessage 把用户插话包成一条 user 消息：带前缀便于回放识别，并明确不要丢原任务。
+func steerMessage(text string) *schema.Message {
+	return schema.UserMessage(steerPrefix + strings.TrimSpace(text) + nl +
+		nl + "（这是用户在任务执行中补充的信息/约束，请把它并入当前任务继续；不要丢弃原任务目标，也不要因此重启分析。）")
 }
 
 type reactRun struct {
@@ -438,6 +449,13 @@ func buildReact(ctx context.Context, cfg reactConfig) (*reactRun, error) {
 		compose.WithStatePreHandler(func(_ context.Context, in []*schema.Message, st *reactState) ([]*schema.Message, error) {
 			if len(st.messages) == 0 {
 				st.messages = in
+			}
+			// 用户中途插话：在下一次模型调用前并入上下文（不新增步数预算）。
+			if cfg.DrainSteers != nil {
+				for _, text := range cfg.DrainSteers() {
+					st.messages = append(st.messages, steerMessage(text))
+					st.steers++
+				}
 			}
 			return st.messages, nil
 		}),
@@ -512,6 +530,7 @@ func (r *reactRun) Run(ctx context.Context, userMessage string) (ReactResult, er
 		Tokens:           r.state.totalTok,
 		PromptTokens:     r.state.promptTok,
 		CompletionTokens: r.state.complTok,
+		Steers:           r.state.steers,
 		Exhausted:        r.state.exhausted,
 		Note:             r.state.exhaustNote,
 		Transcript:       append([]*schema.Message{}, r.state.messages...),

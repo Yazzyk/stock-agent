@@ -312,6 +312,12 @@ export interface AgentSessionEvent {
   ok?: boolean
 }
 
+/** agentlab.steer 返回：queued 是当前排队条数。 */
+export interface AgentSteerResult {
+  ok: boolean
+  queued: number
+}
+
 export interface AgentSessionDetail {
   session: AgentSession
   events: AgentSessionEvent[]

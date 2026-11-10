@@ -303,6 +303,7 @@ const PLUGINS: PluginView[] = [
     methods: [
       { name: 'workers', description: 'worker 列表' },
       { name: 'run', description: '启动 worker' },
+      { name: 'steer', description: '运行中插话（并入同一步）' },
       { name: 'stop', description: '停止运行' },
       { name: 'sessions', description: '历史会话' },
       { name: 'session', description: '会话详情' },
@@ -562,6 +563,8 @@ function syncResult(): SyncResult {
 
 let kernelListener: ((e: KernelEvent) => void) | null = null
 let stopped = false
+/** 演示用：当前正在运行的 session，用于校验插话请求。 */
+let mockRunningSession = ''
 
 export function subscribeMockKernel(cb: (e: KernelEvent) => void): void {
   kernelListener = cb
@@ -586,6 +589,9 @@ const DELTA_STEPS = [
   '计算 MA5/MA10/MA20/MA60 位置关系…\n',
   'flow.stock → 300750 主力净流入 1.42 亿\n',
   '识别到 1 个放量突破信号（300750，量比 2.13）\n',
+  '核对板块资金：半导体 / 电池居前\n',
+  '检查是否触发 Watch 规则…\n',
+  '整理观察要点（3 条）\n',
   '生成研究草稿…\n',
 ]
 
@@ -603,15 +609,18 @@ function reportOf(worker: string): string {
 async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   const id = 's-demo-' + Date.now().toString(36)
   stopped = false
+  mockRunningSession = id
   const wantsWatchRule = /watchdog\.create/.test(input)
   const createdRule = wantsWatchRule ? watchCreateFromDescription(input) : null
   emit('agent.state', { sessionId: id, state: 'thinking', detail: '准备上下文' })
   for (let i = 0; i < DELTA_STEPS.length; i++) {
     if (stopped) break
-    await sleep(260)
+    // 每步 520ms：留出足够的插话窗口（真实环境由模型推理时长决定）
+    await sleep(520)
     emit('agent.delta', { sessionId: id, text: DELTA_STEPS[i] ?? '' })
     if (i === 5) emit('agent.state', { sessionId: id, state: 'tool', detail: 'flow.stock' })
   }
+  if (!stopped) await sleep(900)
   const report = createdRule
     ? '# 已创建 Watch 规则\n\n- 规则：' + createdRule.name + '\n- 触发源：' +
       createdRule.sources.map((s) => (s.type === 'quote' || s.type === 'kline' ? s.type + ':' + (s.codes ?? []).join(',') : s.type === 'sector' ? '板块:' + (s.sector ?? '') : s.type === 'news' ? '新闻:' + (s.keyword ?? '') : '定时:' + (s.times ?? []).join(','))).join(' | ') +
@@ -627,6 +636,7 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
     tokens: usage.totalTokens,
   }
   sessions.unshift(session)
+  mockRunningSession = ''
   if (!stopped) emit('agent.report', { sessionId: id, worker, report, usage })
   emit('agent.state', { sessionId: id, state: stopped ? 'error' : 'done', detail: stopped ? '已手动停止' : '' })
   return { sessionId: id, worker, report, steps: 6, usage }
@@ -1554,7 +1564,17 @@ export function createMockBridge(): GoBridge {
       } else if (plugin === 'agentlab') {
         if (method === 'workers') out = WORKERS
         else if (method === 'run') out = await mockRun(String(p.worker ?? 'chat'), String(p.input ?? ''))
-        else if (method === 'stop') {
+        else if (method === 'steer') {
+          const sid = String(p.sessionId ?? '')
+          const text = String(p.text ?? '').trim()
+          if (text === '') throw new Error('插话内容不能为空')
+          if (sid === '' || sid !== mockRunningSession) throw new Error('会话已结束，无法插话（请重新运行后再试）')
+          if (text.length > 200) throw new Error('插话队列已满：请等 Agent 处理完当前步骤再发')
+          window.setTimeout(() => {
+            if (mockRunningSession === sid) emit('agent.steer', { sessionId: sid, text })
+          }, 280)
+          out = { ok: true, queued: 1 }
+        } else if (method === 'stop') {
           stopped = true
           out = { ok: true }
         } else if (method === 'sessions') out = sessions

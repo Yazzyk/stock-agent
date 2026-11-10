@@ -58,8 +58,10 @@ Go 侧结构体 tag 用 camelCase，与本文件字段名逐字一致。**任何
 | method | 入参 | 返回 |
 |---|---|---|
 | `workers` | `{}` | `[{id, title, description}]`（id: premarket/intraday/postmarket/quant/chat） |
-| `run` | `{worker: string, input?: string, sessionId?: string}` | `{sessionId, worker, report, steps, usage: Usage, error?: string, artifacts?: [{name, path}]}` |
+| `run` | `{worker: string, input?: string, sessionId?: string}` | `{sessionId, worker, report, steps, steers?, usage: Usage, error?: string, artifacts?: [{name, path}]}`（同一 sessionId 运行中再 run 会返回可操作错误） |
+| `send` | `{worker, input, sessionId}` | `{sessionId, report, steers}`；会话运行中自动转插话（回执"已插话"），空闲时等价 run |
 | `stop` | `{sessionId: string}` | `{ok: boolean}` |
+| `steer` | `{sessionId: string, text: string}` | `{ok: boolean, queued: number, sessionId}`（运行中插话：文本在下一次模型调用前并入上下文；会话已结束/队列满/空文本返回中文错误） |
 | `sessions` | `{limit?: number}` | `[{id, worker, title, startedAt, status: "ok"\|"failed"\|"running", tokens}]` |
 | `session` | `{sessionId: string}` | `{session, events: [{seq, time, kind, role?, content, toolName?, ok?}]}` |
 
@@ -67,6 +69,7 @@ Go 侧结构体 tag 用 camelCase，与本文件字段名逐字一致。**任何
 - `agent.delta` → `{sessionId, text}`
 - `agent.state` → `{sessionId, state: "thinking"\|"tool"\|"done"\|"error", detail?}`
 - `agent.report` → `{sessionId, worker, report, usage}`
+- `agent.steer` → `{sessionId, text, queued}`（插话已入队；前端据此渲染成用户消息）
 工具：`agent.run {worker, input}`、`agent.status {}`，
 以及渐进式披露元工具（agentlab 注册，供 ReAct 使用）：`tool.search {query, limit?}`、`tool.describe {name}`、`tool.call {name, args}`。
 

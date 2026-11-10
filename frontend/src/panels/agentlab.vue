@@ -3,17 +3,19 @@
 // 流式数据来自 kernel:event（agent.delta / agent.state / agent.report）。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import StateBlock from '../components/StateBlock.vue'
-import { agentRun, agentSessions, agentSession, agentStop, agentWorkers, messageOf } from '../lib/data'
+import { agentRun, agentSessions, agentSession, agentSteer, agentStop, agentWorkers, messageOf } from '../lib/data'
 import { fmtDateTime } from '../lib/format'
 import { mdToHtml } from '../lib/markdown'
 import { toast } from '../stores/app'
-import { agentState, appendLine, beginRun, clearAgentFeed, endRun } from '../stores/agent'
+import { agentState, appendLine, beginRun, clearAgentFeed, endRun, markSteerPending } from '../stores/agent'
 import type { AgentSession, WorkerInfo } from '../types'
 
 const workers = ref<WorkerInfo[]>([])
 const sessions = ref<AgentSession[]>([])
 const activeWorker = ref('chat')
-const input = ref('')
+/** 底部输入框：新任务模式下是任务描述，运行中切成插话内容。 */
+const composer = ref('')
+const steering = ref(false)
 const tab = ref<'log' | 'report'>('log')
 const loading = ref(true)
 const error = ref('')
@@ -26,6 +28,11 @@ let alive = true
 const selectedWorker = computed(() => workers.value.find((w) => w.id === activeWorker.value) ?? null)
 const reportHtml = computed(() => mdToHtml(agentState.report))
 const canRun = computed(() => !agentState.running && activeWorker.value !== '' && selectedWorker.value !== null)
+/** 运行中且已拿到 sessionId 才允许插话（sessionId 来自 agent.state/delta 事件）。 */
+const isSteer = computed(() => agentState.running && agentState.sessionId !== '')
+const steerBlocked = computed(() => agentState.running && agentState.sessionId === '')
+// 插话必须非空；新任务允许留空（worker 有自己的默认提示），与头部「运行」保持一致
+const canSend = computed(() => (isSteer.value ? composer.value.trim() !== '' : canRun.value) && !steering.value)
 
 const emptyWorkers: WorkerInfo[] = []
 
@@ -57,9 +64,11 @@ async function run(): Promise<void> {
   if (!canRun.value) return
   tab.value = 'log'
   const worker = activeWorker.value
+  const task = composer.value.trim()
+  composer.value = ''
   beginRun(worker)
   try {
-    const res = await agentRun(worker, input.value.trim())
+    const res = await agentRun(worker, task)
     if (!alive) return
     if (res.error) {
       endRun(true, res.error)
@@ -77,6 +86,40 @@ async function run(): Promise<void> {
     endRun(true, messageOf(e))
     toast(messageOf(e), 'error')
   }
+}
+
+/** 运行中插话：不等待 run 返回，直接把文本并入同一 session 的下一步。 */
+async function steer(): Promise<void> {
+  const text = composer.value.trim()
+  if (text === '') {
+    toast('插话内容不能为空', 'warn')
+    return
+  }
+  const sid = agentState.sessionId
+  if (sid === '') {
+    toast('会话还没就绪或已结束，请重新运行后再插话', 'warn')
+    return
+  }
+  steering.value = true
+  try {
+    const res = await agentSteer(sid, text)
+    if (!res.ok) throw new Error('插话未入队，请稍后重试')
+    markSteerPending(text)
+    composer.value = ''
+    toast(res.queued > 0 ? '插话已入队（排队 ' + res.queued + ' 条）' : '插话已发送', 'ok')
+  } catch (e) {
+    toast(messageOf(e), 'error')
+  } finally {
+    steering.value = false
+  }
+}
+
+async function submitComposer(): Promise<void> {
+  if (isSteer.value) {
+    await steer()
+    return
+  }
+  await run()
 }
 
 async function stop(): Promise<void> {
@@ -182,14 +225,12 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
-          <div class="al-section">任务输入</div>
-          <textarea
-            v-model="input"
-            class="textarea"
-            rows="3"
-            :placeholder="selectedWorker ? selectedWorker.title + '：可写关注点，例如「只看半导体与白酒」' : '选择 worker 后填写'"
-            aria-label="任务输入"
-          />
+          <div class="al-hint">
+            <div class="al-section" style="margin-top: 0">任务 / 插话</div>
+            <div class="tiny muted">
+              输入框在右下角：未运行时是「新任务」，运行中自动切「插话」，内容会并入同一步。
+            </div>
+          </div>
 
           <div class="al-section">
             历史会话
@@ -248,6 +289,35 @@ onBeforeUnmount(() => {
           <div v-if="agentState.report === ''" class="tiny muted" style="padding: 10px">还没有报告。运行结束后会自动切到这一页。</div>
           <div v-else class="md" v-html="reportHtml" />
         </div>
+
+        <form class="al-composer" @submit.prevent="submitComposer">
+          <div class="al-composer-hd">
+            <span class="tag" :class="isSteer ? 'tag-accent' : ''">{{ isSteer ? '插话' : '新任务' }}</span>
+            <span class="tiny muted">
+              <template v-if="isSteer">并入同一会话的下一步（{{ agentState.sessionId }}），不影响正在进行的 run</template>
+              <template v-else-if="steerBlocked">运行中，等待 session 就绪…</template>
+              <template v-else-if="agentState.running">运行中…</template>
+              <template v-else>选好 worker 后发送，会开启一次新会话</template>
+            </span>
+            <span class="spacer" />
+            <span class="kbd">Enter 发送</span>
+          </div>
+          <div class="al-composer-row">
+            <textarea
+              v-model="composer"
+              class="textarea"
+              rows="2"
+              :placeholder="isSteer
+                ? '插话：例如「只看半导体和白酒」「先别管指数」'
+                : (selectedWorker ? selectedWorker.title + '：可写关注点，例如「只看半导体与白酒」' : '选择 worker 后填写任务')"
+              :aria-label="isSteer ? '插话内容' : '任务输入'"
+              @keydown.enter.exact.prevent="submitComposer"
+            />
+            <button class="btn btn-accent" type="submit" :disabled="!canSend">
+              {{ isSteer ? (steering ? '发送中…' : '发送插话') : agentState.running ? '运行中…' : '运行' }}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
 
@@ -346,6 +416,35 @@ onBeforeUnmount(() => {
     min-height: 0;
     min-width: 0;
   }
+  .al-hint {
+    padding: 6px 8px;
+    border: 1px dashed var(--line-2);
+    border-radius: var(--radius-sm);
+    line-height: 1.6;
+  }
+  .al-composer {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 8px 10px;
+    border-top: 1px solid var(--line);
+    background: var(--panel-2);
+  }
+  .al-composer-hd {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .al-composer-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+  }
+  .al-composer-row textarea {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
   .al-log {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -382,6 +481,20 @@ onBeforeUnmount(() => {
   }
   .log-line.ok .log-text {
     color: var(--ok);
+  }
+  .log-line.user {
+    border-left: 2px solid var(--info);
+    background: rgba(76, 157, 255, 0.07);
+  }
+  .log-line.user .log-time {
+    color: var(--info);
+  }
+  .log-line.user .log-text {
+    color: #bcd8ff;
+  }
+  .log-line.user-pending .log-text {
+    color: var(--muted);
+    font-style: italic;
   }
   .al-report {
     flex: 1 1 auto;

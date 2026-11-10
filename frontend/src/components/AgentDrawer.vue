@@ -119,6 +119,20 @@ const stateClass = computed(() => {
   .log-line.ok .log-text {
     color: var(--ok);
   }
+  .log-line.user {
+    border-left: 2px solid var(--info);
+    background: rgba(76, 157, 255, 0.07);
+  }
+  .log-line.user .log-time {
+    color: var(--info);
+  }
+  .log-line.user .log-text {
+    color: #bcd8ff;
+  }
+  .log-line.user-pending .log-text {
+    color: var(--muted);
+    font-style: italic;
+  }
   .drawer-report {
     flex: 1 1 auto;
     overflow-y: auto;

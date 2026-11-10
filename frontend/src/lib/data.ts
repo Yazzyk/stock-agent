@@ -8,6 +8,7 @@ import type {
   AgentSessionDetail,
   AgentSessionEvent,
   AgentStatus,
+  AgentSteerResult,
   DocListPayload,
   DocSummary,
   FlowKind,
@@ -253,6 +254,16 @@ export function agentRun(worker: string, input: string, sessionId?: string): Pro
         .filter((a): a is Record<string, unknown> => a !== null)
         .map((a) => ({ name: pickStr(a, 'name') ?? '', path: pickStr(a, 'path') ?? '' })),
     }
+  })
+}
+
+/** 运行中插话：并入同一 session 的下一步。 */
+export function agentSteer(sessionId: string, text: string): Promise<AgentSteerResult> {
+  return guard('发送插话', async () => {
+    const r = rec(await invoke('agentlab', 'steer', { sessionId, text })) ?? {}
+    const raw = r.queued
+    const queued = typeof raw === 'number' ? raw : raw === true ? 1 : 0
+    return { ok: r.ok === true, queued }
   })
 }
 

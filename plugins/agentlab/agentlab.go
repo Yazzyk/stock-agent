@@ -87,6 +87,8 @@ func (a *AgentLab) Activate(c *plugin.Context) error {
 	methods := []plugin.Method{
 		{Name: "workers", Description: "列出 agent worker", Fn: a.workersMethod},
 		{Name: "run", Description: "运行一次 agent 任务", Fn: a.runMethod},
+		{Name: "steer", Description: "给正在运行的任务插话（下一次模型调用前生效）", Fn: a.steerMethod},
+		{Name: "send", Description: "单一入口：运行中自动插话，空闲则启动运行", Fn: a.sendMethod},
 		{Name: "stop", Description: "停止正在运行的任务", Fn: a.stopMethod},
 		{Name: "sessions", Description: "列出历史会话", Fn: a.sessionsMethod},
 		{Name: "session", Description: "查看会话详情与事件", Fn: a.sessionMethod},
@@ -240,6 +242,45 @@ func (a *AgentLab) runMethod(ctx context.Context, payload json.RawMessage) (any,
 		return nil, err
 	}
 	return a.runtime.Run(ctx, in.Worker, in.Input, in.SessionID)
+}
+
+// steerMethod 把用户插话排进运行中会话的队列（step boundary 注入）。
+func (a *AgentLab) steerMethod(_ context.Context, payload json.RawMessage) (any, error) {
+	var in struct {
+		SessionID string `json:"sessionId"`
+		Text      string `json:"text"`
+	}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &in); err != nil {
+			return nil, fmt.Errorf("steer 参数不是合法 JSON：%w", err)
+		}
+	}
+	if err := a.runtime.Steer(in.SessionID, in.Text); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"ok":        true,
+		"queued":    a.runtime.SteerQueueLen(in.SessionID),
+		"sessionId": in.SessionID,
+	}, nil
+}
+
+// sendMethod 是前端单一入口：会话在跑就插话，否则启动运行。
+func (a *AgentLab) sendMethod(ctx context.Context, payload json.RawMessage) (any, error) {
+	var in struct {
+		Worker    string `json:"worker"`
+		Input     string `json:"input"`
+		SessionID string `json:"sessionId"`
+	}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &in); err != nil {
+			return nil, fmt.Errorf("send 参数不是合法 JSON：%w", err)
+		}
+	}
+	if err := a.requireModel(ctx); err != nil {
+		return nil, err
+	}
+	return a.runtime.Send(ctx, in.Worker, in.Input, in.SessionID)
 }
 
 func (a *AgentLab) stopMethod(_ context.Context, payload json.RawMessage) (any, error) {

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -370,6 +371,210 @@ func TestRuntimeUsageFallbacks(t *testing.T) {
 	}
 	if reportB.UsageNote != "" {
 		t.Fatalf("分项齐全时不应有 UsageNote，实际: %q", reportB.UsageNote)
+	}
+}
+
+// messagesText 把一次模型调用的上下文拼成可断言的大字符串。
+func messagesText(msgs []contract.Message) string {
+	parts := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		parts = append(parts, string(m.Role)+":"+m.Content)
+	}
+	return strings.Join(parts, " || ")
+}
+
+func TestSteerInjectedBeforeNextModelCall(t *testing.T) {
+	gate := make(chan struct{})
+	// 第 1 次调用先查一次工具，让 ReAct 循环必须进入第 2 次模型调用。
+	llm := &fakeLLM{blockFirst: gate, script: []contract.Message{
+		asstToolCall("c1", "tool.search", `{"query":"quote"}`),
+		{Role: contract.RoleAssistant, Content: "已按新增约束修正：仓位上限三成"},
+	}}
+	rt, _, _, sink := newTestRuntime(t, llm)
+
+	done := make(chan Report, 1)
+	go func() {
+		rep, _ := rt.Run(context.Background(), "chat", "分析今天怎么做", "sess-steer")
+		done <- rep
+	}()
+	if !waitFor(t, 2*time.Second, func() bool { return llm.enteredCount() >= 1 }) {
+		t.Fatal("模型第 1 次调用应已开始")
+	}
+	if err := rt.Steer("sess-steer", "把仓位上限压到三成"); err != nil {
+		t.Fatalf("运行中插话应成功: %v", err)
+	}
+	if got := rt.SteerQueueLen("sess-steer"); got != 1 {
+		t.Fatalf("插话应入队 1 条，实际 %d", got)
+	}
+	close(gate)
+
+	var rep Report
+	select {
+	case rep = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("插话后运行应正常结束")
+	}
+	if rep.Steers != 1 {
+		t.Fatalf("报告应记录 1 次插话，实际 %d", rep.Steers)
+	}
+	if len(llm.seen) < 2 {
+		t.Fatalf("应有至少 2 次模型调用，实际 %d", len(llm.seen))
+	}
+	second := messagesText(llm.seen[1])
+	if !strings.Contains(second, steerPrefix+"把仓位上限压到三成") {
+		t.Fatalf("第 2 次模型调用必须带上用户插话，实际上下文: %s", second)
+	}
+	if !strings.Contains(second, "不要丢弃原任务") {
+		t.Fatalf("插话消息必须包含「不要丢弃原任务」的说明，实际: %s", second)
+	}
+	if strings.Contains(messagesText(llm.seen[0]), steerPrefix) {
+		t.Fatal("第 1 次调用发生在插话之前，不应包含插话")
+	}
+
+	// 事件：agent.steer 恰好一次，payload 固定 {sessionId,text,queued}
+	steers := sink.byTopic("agent.steer")
+	if len(steers) != 1 {
+		t.Fatalf("agent.steer 事件应恰好 1 条，实际 %d", len(steers))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(steers[0].Payload, &payload); err != nil {
+		t.Fatalf("agent.steer payload 必须是 JSON: %v", err)
+	}
+	if payload["sessionId"] != "sess-steer" || payload["text"] != "把仓位上限压到三成" {
+		t.Fatalf("agent.steer payload 不对: %+v", payload)
+	}
+	if _, ok := payload["queued"]; !ok {
+		t.Fatalf("agent.steer payload 必须带 queued: %+v", payload)
+	}
+
+	// 会话事件：重放能看到一条 kind=user 且以 [用户插话] 开头的事件
+	detail, err := rt.Session("sess-steer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	steerEvents := 0
+	for _, e := range detail.Events {
+		if e.Kind == EventUser && strings.HasPrefix(e.Content, steerPrefix) {
+			steerEvents++
+		}
+	}
+	if steerEvents != 1 {
+		t.Fatalf("重放应看到恰好 1 条插话事件，实际 %d", steerEvents)
+	}
+}
+
+func TestSteerTwoInjectionsKeepOrder(t *testing.T) {
+	llm := &fakeLLM{script: []contract.Message{
+		asstToolCall("c1", "tool.search", `{"query":"quote"}`),
+		asstToolCall("c2", "tool.search", `{"query":"kline"}`),
+		{Role: contract.RoleAssistant, Content: "第 3 步：两条约束都体现"},
+	}}
+	rt, _, _, _ := newTestRuntime(t, llm)
+	// 第 1 次调用之后插第一条（会在第 2 次调用前生效），第 2 次之后插第二条（第 3 次前生效）。
+	llm.afterCall = func(n int) {
+		if n == 1 {
+			_ = rt.Steer("sess-two", "第一条：只看主板")
+		}
+		if n == 2 {
+			_ = rt.Steer("sess-two", "第二条：不要碰 ST")
+		}
+	}
+	rep, err := rt.Run(context.Background(), "chat", "任务：给方案", "sess-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Steers != 2 {
+		t.Fatalf("应记录 2 次插话，实际 %d", rep.Steers)
+	}
+	if len(llm.seen) < 3 {
+		t.Fatalf("应有至少 3 次模型调用，实际 %d", len(llm.seen))
+	}
+	second := messagesText(llm.seen[1])
+	third := messagesText(llm.seen[2])
+	if !strings.Contains(second, "第一条：只看主板") {
+		t.Fatalf("第 2 次调用应带第 1 条插话，实际: %s", second)
+	}
+	if strings.Contains(second, "第二条：不要碰 ST") {
+		t.Fatalf("第 2 次调用不应提前带上第 2 条插话，实际: %s", second)
+	}
+	if !strings.Contains(third, "第一条：只看主板") || !strings.Contains(third, "第二条：不要碰 ST") {
+		t.Fatalf("第 3 次调用应带两条插话，实际: %s", third)
+	}
+	if strings.Index(third, "第一条：只看主板") > strings.Index(third, "第二条：不要碰 ST") {
+		t.Fatalf("插话顺序必须稳定（先到先得），实际: %s", third)
+	}
+}
+
+func TestSteerValidationAndQueueLimit(t *testing.T) {
+	gate := make(chan struct{})
+	defer close(gate)
+	llm := &fakeLLM{block: gate}
+	rt, _, _, _ := newTestRuntime(t, llm)
+
+	// 未运行 / 不存在
+	if err := rt.Steer("nope", "x"); err == nil || !strings.Contains(err.Error(), "已结束") {
+		t.Fatalf("未运行会话应报「已结束」，实际: %v", err)
+	}
+	if err := rt.Steer("sess-q", "   "); err == nil || !strings.Contains(err.Error(), "不能为空") {
+		t.Fatalf("空插话应报错，实际: %v", err)
+	}
+	if err := rt.Steer("sess-q", strings.Repeat("长", maxSteerRunes+1)); err == nil || !strings.Contains(err.Error(), "过长") {
+		t.Fatalf("超长插话应报错，实际: %v", err)
+	}
+
+	go func() { _, _ = rt.Run(context.Background(), "chat", "队列上限测试", "sess-q") }()
+	if !waitFor(t, 2*time.Second, func() bool { return rt.isRunning("sess-q") }) {
+		t.Fatal("会话应进入运行中")
+	}
+	for i := 0; i < maxSteerQueue; i++ {
+		if err := rt.Steer("sess-q", fmt.Sprintf("插话 %d", i+1)); err != nil {
+			t.Fatalf("第 %d 条插话应成功: %v", i+1, err)
+		}
+	}
+	if err := rt.Steer("sess-q", "第 6 条"); err == nil || !strings.Contains(err.Error(), "队列已满") {
+		t.Fatalf("超过队列上限应报错，实际: %v", err)
+	}
+	if got := rt.SteerQueueLen("sess-q"); got != maxSteerQueue {
+		t.Fatalf("队列应保持 %d 条，实际 %d", maxSteerQueue, got)
+	}
+}
+
+func TestRunRejectsRunningSessionAndSendRoutesToSteer(t *testing.T) {
+	gate := make(chan struct{})
+	llm := &fakeLLM{block: gate, script: []contract.Message{
+		{Role: contract.RoleAssistant, Content: "结束"},
+	}}
+	rt, _, _, _ := newTestRuntime(t, llm)
+
+	done := make(chan Report, 1)
+	go func() {
+		rep, _ := rt.Run(context.Background(), "chat", "第一轮", "sess-dup")
+		done <- rep
+	}()
+	if !waitFor(t, 2*time.Second, func() bool { return rt.isRunning("sess-dup") }) {
+		t.Fatal("会话应进入运行中")
+	}
+	// 同一 sessionId 再 Run 必须报可操作错误，而不是静默另起。
+	if _, err := rt.Run(context.Background(), "chat", "第二轮", "sess-dup"); err == nil ||
+		!strings.Contains(err.Error(), "正在运行") || !strings.Contains(err.Error(), "steer") {
+		t.Fatalf("运行中重复 Run 应报错并提示 steer，实际: %v", err)
+	}
+	// Send 在运行中自动转插话。
+	rep, err := rt.Send(context.Background(), "chat", "补充：只看主板", "sess-dup")
+	if err != nil {
+		t.Fatalf("Send 运行中应转插话: %v", err)
+	}
+	if rep.Steers != 1 || !strings.Contains(rep.Report, "已插话") || rep.SessionID != "sess-dup" {
+		t.Fatalf("Send 插话返回不对: %+v", rep)
+	}
+	if got := rt.SteerQueueLen("sess-dup"); got != 1 {
+		t.Fatalf("Send 应把消息排进队列，实际 %d", got)
+	}
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("运行应正常结束")
 	}
 }
 

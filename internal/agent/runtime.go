@@ -43,6 +43,8 @@ type Report struct {
 	Deduped   bool           `json:"deduped,omitempty"`
 	// UsageNote 说明 usage 的口径限制（例如上游只给总 token），前端可据此提示。
 	UsageNote string `json:"usageNote,omitempty"`
+	// Steers 是本次运行实际并入上下文的插话条数。
+	Steers int `json:"steers,omitempty"`
 }
 
 // Artifact 是运行产出的文件（当前只登记知识库回写）。
@@ -65,6 +67,19 @@ type runHandle struct {
 // maxRetriesPerTask 是单个任务允许的自动重试次数（看护器超时用）。
 const maxRetriesPerTask = 1
 
+// 插话（steering）相关上限与文案。
+const (
+	steerPrefix   = "[用户插话] "
+	maxSteerRunes = 1000
+	maxSteerQueue = 5
+)
+
+// steerQueue 是某个运行中会话的插话队列（step boundary 注入）。
+type steerQueue struct {
+	mu      sync.Mutex
+	pending []string
+}
+
 type dedupedReport struct {
 	report Report
 	at     time.Time
@@ -80,6 +95,7 @@ type Runtime struct {
 
 	mu       sync.Mutex
 	running  map[string]*runHandle
+	steer    map[string]*steerQueue
 	recent   []dedupedReport
 	attempts map[string]int
 	watch    chan struct{}
@@ -102,6 +118,7 @@ func NewRuntime(opts RuntimeOptions) *Runtime {
 		router:   NewRouter(opts.Clock, opts.LLM),
 		log:      opts.Logger,
 		running:  map[string]*runHandle{},
+		steer:    map[string]*steerQueue{},
 		attempts: map[string]int{},
 	}
 	return r
@@ -119,6 +136,109 @@ func (r *Runtime) Session(sessionID string) (SessionDetail, error) {
 		return SessionDetail{}, fmt.Errorf("session 需要 sessionId")
 	}
 	return r.sessions.Get(sessionID)
+}
+
+// Steer 给正在运行的会话插话：消息会在下一次模型调用前并入上下文（step boundary 注入）。
+// 只对运行中的会话有效；已结束/不存在、空文本、超长、队列已满都返回可操作的中文错误。
+func (r *Runtime) Steer(sessionID, text string) error {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return fmt.Errorf("插话需要 sessionId")
+	}
+	content := strings.TrimSpace(text)
+	if content == "" {
+		return fmt.Errorf("插话内容不能为空")
+	}
+	if n := len([]rune(content)); n > maxSteerRunes {
+		return fmt.Errorf("插话内容过长（%d 字），请控制在 %d 字以内", n, maxSteerRunes)
+	}
+
+	r.mu.Lock()
+	_, running := r.running[id]
+	q := r.steer[id]
+	if !running || q == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("会话 %s 已结束，无法插话", id)
+	}
+	q.mu.Lock()
+	if len(q.pending) >= maxSteerQueue {
+		queued := len(q.pending)
+		q.mu.Unlock()
+		r.mu.Unlock()
+		return fmt.Errorf("插话队列已满（%d 条），请等当前步骤执行完再发", queued)
+	}
+	q.pending = append(q.pending, content)
+	queued := len(q.pending)
+	q.mu.Unlock()
+	r.mu.Unlock()
+
+	// 事件先发（前端立刻看到），会话事件随后落盘，保证重放可见。
+	r.emit("agent.steer", map[string]any{"sessionId": id, "text": content, "queued": queued})
+	if _, err := r.sessions.Append(id, Event{Kind: EventUser, Role: string(contract.RoleUser), Content: steerPrefix + content}); err != nil {
+		r.log.Warn("插话会话事件落盘失败", "session", id, "error", err)
+	}
+	return nil
+}
+
+// isRunning 判断会话是否正在运行。
+func (r *Runtime) isRunning(sessionID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.running[sessionID]
+	return ok
+}
+
+// Send 是前端唯一入口：会话正在运行时自动转为插话，空闲则启动一次运行并同步返回报告。
+func (r *Runtime) Send(ctx context.Context, worker, input, sessionID string) (Report, error) {
+	if strings.TrimSpace(sessionID) != "" && r.isRunning(sessionID) {
+		if err := r.Steer(sessionID, input); err != nil {
+			return Report{}, err
+		}
+		return Report{
+			SessionID: sessionID,
+			Worker:    string(NormalizeWorker(worker)),
+			Report:    "已插话：这条消息会在下一次模型调用前并入上下文",
+			Steers:    1,
+		}, nil
+	}
+	return r.Run(ctx, worker, input, sessionID)
+}
+
+// SteerQueueLen 返回某个会话当前待注入的插话条数（未运行返回 0）。
+func (r *Runtime) SteerQueueLen(sessionID string) int {
+	r.mu.Lock()
+	q := r.steer[sessionID]
+	r.mu.Unlock()
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.pending)
+}
+
+// beginSteer 为一次运行登记插话队列，返回"取走全部待注入插话"的 drain 函数。
+func (r *Runtime) beginSteer(sessionID string) func() []string {
+	q := &steerQueue{}
+	r.mu.Lock()
+	r.steer[sessionID] = q
+	r.mu.Unlock()
+	return func() []string {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if len(q.pending) == 0 {
+			return nil
+		}
+		out := q.pending
+		q.pending = nil
+		return out
+	}
+}
+
+func (r *Runtime) endSteer(sessionID string) {
+	r.mu.Lock()
+	delete(r.steer, sessionID)
+	r.mu.Unlock()
 }
 
 // Running 返回正在运行的会话 id 列表。
@@ -179,6 +299,9 @@ func (r *Runtime) execute(ctx context.Context, spec WorkerSpec, decision RouteDe
 	if strings.TrimSpace(sessionID) == "" {
 		sessionID = r.opts.IDGen()
 	}
+	if r.isRunning(sessionID) {
+		return Report{}, fmt.Errorf("会话 %s 正在运行，请用 steer 插话或先 stop", sessionID)
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -195,6 +318,8 @@ func (r *Runtime) execute(ctx context.Context, spec WorkerSpec, decision RouteDe
 	}
 	_, _ = r.sessions.Append(sessionID, Event{Kind: EventUser, Role: string(contract.RoleUser), Content: input})
 
+	drainSteers := r.beginSteer(sessionID)
+	defer r.endSteer(sessionID)
 	taskKey := string(spec.ID) + "|" + normalizeInput(input)
 	r.track(sessionID, cancel, spec.ID, input, taskKey, r.attemptOf(taskKey))
 	defer r.untrack(sessionID)
@@ -208,12 +333,13 @@ func (r *Runtime) execute(ctx context.Context, spec WorkerSpec, decision RouteDe
 	}
 
 	react, err := buildReact(runCtx, reactConfig{
-		LLM:       r.opts.LLM,
-		Gateway:   r.opts.Gateway,
-		System:    spec.System,
-		MaxSteps:  r.maxSteps(),
-		MaxTokens: r.maxTokens(),
-		OnDelta:   onDelta,
+		LLM:         r.opts.LLM,
+		Gateway:     r.opts.Gateway,
+		System:      spec.System,
+		MaxSteps:    r.maxSteps(),
+		MaxTokens:   r.maxTokens(),
+		OnDelta:     onDelta,
+		DrainSteers: drainSteers,
 	})
 	if err != nil {
 		r.finishFailed(sessionID, meta, err)
@@ -241,6 +367,7 @@ func (r *Runtime) execute(ctx context.Context, spec WorkerSpec, decision RouteDe
 		Report:    strings.TrimSpace(res.Content),
 		Steps:     res.Steps,
 		Usage:     usage,
+		Steers:    res.Steers,
 	}
 	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens > 0 {
 		// 上游（如 DeepSeek 流式）可能只回 total；此时分项不可得，明确告知前端不要显示 0。

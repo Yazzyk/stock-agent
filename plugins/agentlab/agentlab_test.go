@@ -66,13 +66,28 @@ func (s *memStore) Close() error { return nil }
 
 // fakeLLM 按脚本回放，HasKey 决定"有没有配模型"。
 type fakeLLM struct {
-	mu     sync.Mutex
-	script []contract.Message
-	hasKey bool
-	calls  int
+	mu         sync.Mutex
+	script     []contract.Message
+	hasKey     bool
+	calls      int
+	entered    int
+	seen       []contract.ChatRequest
+	blockFirst chan struct{}
 }
 
 func (f *fakeLLM) Chat(ctx context.Context, req contract.ChatRequest) (contract.Reply, error) {
+	f.mu.Lock()
+	f.entered++
+	n := f.entered
+	f.seen = append(f.seen, req)
+	f.mu.Unlock()
+	if f.blockFirst != nil && n == 1 {
+		select {
+		case <-ctx.Done():
+			return contract.Reply{}, ctx.Err()
+		case <-f.blockFirst:
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -94,6 +109,21 @@ func (f *fakeLLM) Stream(ctx context.Context, req contract.ChatRequest, onDelta 
 
 func (f *fakeLLM) Models(context.Context) ([]contract.ModelInfo, error) {
 	return []contract.ModelInfo{{Provider: "fake", Model: "fake", HasKey: f.hasKey, IsDefault: true}}, nil
+}
+
+func (f *fakeLLM) enteredCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.entered
+}
+
+func (f *fakeLLM) requestAt(i int) contract.ChatRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i < 0 || i >= len(f.seen) {
+		return contract.ChatRequest{}
+	}
+	return f.seen[i]
 }
 
 func (f *fakeLLM) Default(context.Context) (contract.ModelInfo, error) {
@@ -288,6 +318,133 @@ func TestAgentLabNoModelFailsFast(t *testing.T) {
 	if llm.calls != 0 {
 		t.Fatalf("无 key 时不应发起模型调用，实际 %d 次", llm.calls)
 	}
+}
+
+func TestAgentLabSteerMethod(t *testing.T) {
+	gate := make(chan struct{})
+	llm := &fakeLLM{hasKey: true, blockFirst: gate, script: []contract.Message{
+		{Role: contract.RoleAssistant, ToolCalls: []contract.ToolCall{
+			{ID: "c1", Name: "tool.search", Arguments: `{"query":"quote"}`},
+		}},
+		{Role: contract.RoleAssistant, Content: "已并入补充约束后的结论"},
+	}}
+	c := testContext(t, newMemStore(), llm, hostWithMarket())
+	p := New()
+	if err := p.Activate(c); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Deactivate(context.Background())
+
+	run, _ := c.Methods.Get("run")
+	raw, _ := json.Marshal(map[string]any{"worker": "chat", "input": "给个方案", "sessionId": "sess-plugin"})
+	done := make(chan any, 1)
+	go func() {
+		out, err := run.Fn(context.Background(), raw)
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- out
+	}()
+	if !waitForPlugin(t, 2*time.Second, func() bool { return llm.enteredCount() >= 1 }) {
+		t.Fatal("模型第 1 次调用应已开始")
+	}
+
+	steer, ok := c.Methods.Get("steer")
+	if !ok {
+		t.Fatal("必须提供 steer 方法")
+	}
+	raw, _ = json.Marshal(map[string]any{"sessionId": "sess-plugin", "text": "只看主板"})
+	out, err := steer.Fn(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("运行中插话应成功: %v", err)
+	}
+	buf, _ := json.Marshal(out)
+	if !strings.Contains(string(buf), `"ok":true`) || !strings.Contains(string(buf), `"queued":1`) ||
+		!strings.Contains(string(buf), `"sessionId":"sess-plugin"`) {
+		t.Fatalf("steer 应返回 {ok,queued,sessionId}，实际: %s", string(buf))
+	}
+	close(gate)
+
+	select {
+	case res := <-done:
+		if e, isErr := res.(error); isErr {
+			t.Fatalf("run 应成功返回: %v", e)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("插话后 run 应正常结束")
+	}
+	second := llm.requestAt(1)
+	joined := ""
+	for _, m := range second.Messages {
+		joined += string(m.Role) + ":" + m.Content + " || "
+	}
+	if !strings.Contains(joined, "[用户插话] 只看主板") {
+		t.Fatalf("第 2 次模型调用必须带上插件插话，实际: %s", joined)
+	}
+
+	// 结束后插话必须报错；空文本也必须报错。
+	if _, err := steer.Fn(context.Background(), mustJSON(map[string]any{"sessionId": "sess-plugin", "text": "太晚了"})); err == nil ||
+		!strings.Contains(err.Error(), "已结束") {
+		t.Fatalf("会话结束后插话应报错，实际: %v", err)
+	}
+	if _, err := steer.Fn(context.Background(), mustJSON(map[string]any{"sessionId": "sess-plugin", "text": "  "})); err == nil {
+		t.Fatal("空插话必须报错")
+	}
+}
+
+func TestAgentLabSendRoutesWhileRunning(t *testing.T) {
+	gate := make(chan struct{})
+	llm := &fakeLLM{hasKey: true, blockFirst: gate, script: []contract.Message{
+		{Role: contract.RoleAssistant, ToolCalls: []contract.ToolCall{
+			{ID: "c1", Name: "tool.search", Arguments: `{"query":"quote"}`},
+		}},
+		{Role: contract.RoleAssistant, Content: "完成"},
+	}}
+	c := testContext(t, newMemStore(), llm, hostWithMarket())
+	p := New()
+	if err := p.Activate(c); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Deactivate(context.Background())
+
+	run, _ := c.Methods.Get("run")
+	raw, _ := json.Marshal(map[string]any{"worker": "chat", "input": "给个方案", "sessionId": "sess-send"})
+	go func() { _, _ = run.Fn(context.Background(), raw) }()
+	if !waitForPlugin(t, 2*time.Second, func() bool { return llm.enteredCount() >= 1 }) {
+		t.Fatal("模型第 1 次调用应已开始")
+	}
+
+	send, ok := c.Methods.Get("send")
+	if !ok {
+		t.Fatal("必须提供 send 方法（前端单入口）")
+	}
+	out, err := send.Fn(context.Background(), mustJSON(map[string]any{"worker": "chat", "input": "补充：只看主板", "sessionId": "sess-send"}))
+	if err != nil {
+		t.Fatalf("运行中 send 应转插话: %v", err)
+	}
+	buf, _ := json.Marshal(out)
+	if !strings.Contains(string(buf), "已插话") {
+		t.Fatalf("运行中 send 应返回插话回执，实际: %s", string(buf))
+	}
+	close(gate)
+}
+
+func mustJSON(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func waitForPlugin(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
 }
 
 func TestAgentLabStatusTool(t *testing.T) {

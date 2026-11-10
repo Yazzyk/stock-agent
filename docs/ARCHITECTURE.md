@@ -83,6 +83,21 @@ Trigger(用户输入 / 定时 / 市场事件)
 - Session 是**只追加事件日志**（sqlite \`sessions\`/\`session_events\`），可重放、可审计。
 - Watchdog：定时心跳 + 任务超时（5 分钟）+ 失败重试一次；恢复后从日志重建状态。
 
+### 4.1 会话插话（steering：step-boundary 注入）
+
+运行中的会话收到用户新消息时，**不另起会话、不丢弃**，而是入队并在**下一次模型调用前**并入上下文：
+
+\`\`\`
+用户消息(运行中) ──► Runtime.Steer(sessionId,text) ──► 队列(每会话 ≤5 条)
+                                                      │
+ReAct loop:  model 调用前 drain ──► append user "[用户插话] …" ──► 继续原任务
+                                                      │
+                                   session 事件(kind=user) + 前端 agent.steer
+\`\`\`
+
+同一 sessionId 在运行时再调 Run 会返回可操作错误（提示改用 steer 或先 stop），避免并发写同一会话。
+插话只追加约束，不重置任务目标，也不增加步数预算。
+
 ## 5. 渐进式披露（三级，本项目的核心机制）
 
 同一套三段式用在 **tool / skill / rag** 三类资源上：**索引 → 展开 → 取全量**。

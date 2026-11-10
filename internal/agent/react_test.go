@@ -23,6 +23,10 @@ type fakeLLM struct {
 	seen    [][]contract.Message
 	// block 不为 nil 时 Chat/Stream 会阻塞到 ctx 结束，用来测超时与 Stop。
 	block chan struct{}
+	// blockFirst 只阻塞第 1 次调用，用来测"运行中插话"。
+	blockFirst chan struct{}
+	// afterCall 在每次 Chat 结束时回调（参数是第几次调用），用来在同一步之后插话。
+	afterCall func(n int)
 	// usage 不为 nil 时按它返回 token 用量，用来测 usage 兜底口径。
 	usage *contract.Usage
 }
@@ -48,14 +52,25 @@ func (f *fakeLLM) record(req contract.ChatRequest) {
 func (f *fakeLLM) Chat(ctx context.Context, req contract.ChatRequest) (contract.Reply, error) {
 	f.mu.Lock()
 	f.entered++
+	n := f.entered
 	f.mu.Unlock()
 	f.record(req)
+	if f.blockFirst != nil && n == 1 {
+		select {
+		case <-ctx.Done():
+			return contract.Reply{}, ctx.Err()
+		case <-f.blockFirst:
+		}
+	}
 	if f.block != nil {
 		select {
 		case <-ctx.Done():
 			return contract.Reply{}, ctx.Err()
 		case <-f.block:
 		}
+	}
+	if f.afterCall != nil {
+		f.afterCall(n)
 	}
 	msg, err := f.next()
 	if err != nil {
