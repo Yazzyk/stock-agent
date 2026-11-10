@@ -1,0 +1,31 @@
+# 编译产物
+/guanlan
+/stock-agent
+/bin/
+build/bin/
+/dist/
+
+# 本地数据与配置
+*.csv
+data/cache/
+.env
+.env.*
+
+# 前端
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/index.html
+
+# 运行产物
+runs/
+memory/
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# 系统
+.DS_Store
+build/darwin/
+build/windows/
+build/linux/

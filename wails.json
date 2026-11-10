@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "guanlan",
+  "outputfilename": "guanlan",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "yazzyk",
+    "email": "yazzyk@users.noreply.github.com"
+  },
+  "info": {
+    "companyName": "观澜",
+    "productName": "观澜 Stock Agent",
+    "productVersion": "0.1.0",
+    "copyright": "研究用途，不构成投资建议",
+    "comments": "A 股研究型 harness agent 桌面端"
+  }
+}
