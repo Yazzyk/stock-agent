@@ -49,6 +49,7 @@ func (p *Plugin) Manifest() plugin.Manifest {
 		Tags:        []string{"watch", "market"},
 		Provides: []string{
 			"method:list", "method:sync", "method:add", "method:remove", "method:groups",
+			"method:check", "method:saveCookie", "method:captureCookie", "method:privacy",
 			"tool:watch.list", "tool:watch.sync", "tool:market.quote", "tool:market.search",
 			"ui:watchlist",
 		},
@@ -64,6 +65,10 @@ func (p *Plugin) Activate(ctx *plugin.Context) error {
 		{Name: "add", Description: "添加自选", Fn: p.methodAdd},
 		{Name: "remove", Description: "移除自选", Fn: p.methodRemove},
 		{Name: "groups", Description: "返回分组列表", Fn: p.methodGroups},
+		{Name: "check", Description: "同步前置诊断（只读，不触发同步）", Fn: p.methodCheck},
+		{Name: "saveCookie", Description: "校验并保存同花顺网页登录态", Fn: p.methodSaveCookie},
+		{Name: "captureCookie", Description: "尝试从本机浏览器读取登录态", Fn: p.methodCaptureCookie},
+		{Name: "privacy", Description: "完全磁盘访问设置入口", Fn: p.methodPrivacy},
 	}
 	for _, m := range methods {
 		if err := ctx.Methods.Add(m); err != nil {

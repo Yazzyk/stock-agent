@@ -1,0 +1,11 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-fund",
+  "data": {
+    "timestamp": 1794549622938,
+    "item": [
+      {"thscode":"510300.SH","ticker":"510300","fund_name":"沪深300ETF华泰柏瑞","fund_type":"股票型","company_id":"80000222","manager_id":"30123456","setup_date":"2012-05-04","scale":128000000000}
+    ]
+  }
+}

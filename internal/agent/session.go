@@ -27,9 +27,17 @@ const (
 	StatusFailed  = "failed"
 )
 
+// 会话模式（编队）：main=用户直接发起的会话，subagent=主会话派生的子智能体。
+const (
+	ModeMain     = "main"
+	ModeSubagent = "subagent"
+)
+
 // 事件类型。
 const (
-	EventUser      = "user"
+	EventUser = "user"
+	// EventSystem 是会话的系统提示词（会话第一条事件，供轨迹审计）。
+	EventSystem    = "system"
 	EventAssistant = "assistant"
 	EventTool      = "tool"
 	EventState     = "state"
@@ -61,6 +69,27 @@ type SessionMeta struct {
 	Tokens    int        `json:"tokens"`
 	Report    string     `json:"report,omitempty"`
 	Error     string     `json:"error,omitempty"`
+	// Model 是本次会话实际使用的模型（空表示 LLM 默认模型）。
+	Model string `json:"model,omitempty"`
+
+	// 编队信息（契约 §3.6）。旧数据没有这三个字段：ParentID=="" 且 Mode==""，
+	// 反序列化后按主会话处理，不会因为升级而丢会话。
+	ParentID string `json:"parentId,omitempty"`
+	Mode     string `json:"mode,omitempty"`
+	Label    string `json:"label,omitempty"`
+}
+
+// IsSubagent 判断会话是否是子智能体（兼容旧数据：缺 Mode 但有 ParentID 也算）。
+func (m SessionMeta) IsSubagent() bool {
+	return m.Mode == ModeSubagent || m.ParentID != ""
+}
+
+// ModeOrDefault 返回会话模式；旧数据（Mode 为空）回落成 main。
+func (m SessionMeta) ModeOrDefault() string {
+	if m.Mode == "" {
+		return ModeMain
+	}
+	return m.Mode
 }
 
 // SessionDetail 是会话详情（API.md 第 5 节 session 方法）。
@@ -240,6 +269,7 @@ type SessionSummary struct {
 	StartedAt string `json:"startedAt"`
 	Status    string `json:"status"`
 	Tokens    int    `json:"tokens"`
+	Model     string `json:"model,omitempty"`
 }
 
 // Summaries 返回会话列表视图。
@@ -257,6 +287,7 @@ func (s *SessionStore) Summaries(limit int) ([]SessionSummary, error) {
 			StartedAt: m.StartedAt.Format(time.RFC3339),
 			Status:    m.Status,
 			Tokens:    m.Tokens,
+			Model:     m.Model,
 		})
 	}
 	return out, nil

@@ -1,0 +1,11 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-news",
+  "data": {
+    "items": [
+      {"id":"1","title":"央行开展逆回购操作","summary":"公开市场净投放 1200 亿元","publish_time":1794552000000,"source":"同花顺"},
+      {"id":"2","title":"某公司发布业绩预告","summary":"预计净利润同比增长 30%","publish_time":1794551000000,"source":"同花顺"}
+    ]
+  }
+}

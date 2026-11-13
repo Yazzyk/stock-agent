@@ -1,0 +1,1332 @@
+package datasource
+
+import "github.com/yazzyk/stock-agent/pkg/contract"
+
+// 同花顺官方 API 端点目录（数据驱动，唯一真相）。
+//
+// 生成依据：https://fuyao.aicubes.cn/llms-full.txt（2026-11-13 抓取）与
+// docs/api-reference/overview/。字段说明与单位见 docs/FUYAO-API.md；
+// 这里只保留「调用必须知道」的部分：路径、必填参数、单次上限、权限与口径备注。
+//
+// 注意：catalog 是**离线常量**，不随网络变化；新增/下线端点时必须同步
+// docs/FUYAO-API.md 与单测，避免工具 schema 与文档漂移。
+
+// fuyaoCatalog 返回全部官方端点（按 path 升序稳定排列）。
+func fuyaoCatalog() []contract.FuyaoEndpoint {
+	out := make([]contract.FuyaoEndpoint, len(fuyaoEndpoints))
+	copy(out, fuyaoEndpoints)
+	return out
+}
+
+// fuyaoEndpointByID 按端点 ID 查目录；ID 是去掉 /api/ 前缀后把 / 换成 . 的形式。
+func fuyaoEndpointByID(id string) (contract.FuyaoEndpoint, bool) {
+	for _, ep := range fuyaoEndpoints {
+		if ep.ID == id || ep.Path == id {
+			return ep, true
+		}
+	}
+	return contract.FuyaoEndpoint{}, false
+}
+
+// fuyaoEndpoints 是官方端点目录（125 个；含 3 个 Parquet 导出链接与估值快照）。
+var fuyaoEndpoints = []contract.FuyaoEndpoint{
+	{
+		ID:         "a-share-index.baseinfo.new-concepts",
+		Path:       "/api/a-share-index/baseinfo/new-concepts",
+		Title:      "同花顺新增概念",
+		Group:      "指数",
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "从1开始的页码"},
+			{Name: "size", Type: "integer", Required: false, Default: "15", Desc: "每页1至15条，默认15"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "a-share-index.catalog.ths-index-list",
+		Path:  "/api/a-share-index/catalog/ths-index-list",
+		Title: "同花顺指数列表",
+		Group: "指数",
+		Params: []contract.FuyaoParam{
+			{Name: "tag", Type: "string", Required: false, Default: "cn_concept", Desc: "标签白名单：cn_concept(A 股概念) / region(区域指数) / tszs(特色指数) / industry(行业指数)。大小写不敏感。"},
+		},
+	},
+	{
+		ID:    "a-share-index.constituents.ths-index-list-by-stock",
+		Path:  "/api/a-share-index/constituents/ths-index-list-by-stock",
+		Title: "个股反查对应行业/板块",
+		Group: "指数",
+		Limit: 100,
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "1 至 100 个完整个股代码，以英文逗号分隔，如 000713.SZ,600519.SH；上限按去重前数量计算。"},
+			{Name: "type", Type: "string", Required: false, Default: "全部四类", Desc: "单一分类：cn_concept / industry / region / tszs，分别为概念、行业、地域、特色；大小写敏感。"},
+		},
+	},
+	{
+		ID:    "a-share-index.constituents.ths-stock-list",
+		Path:  "/api/a-share-index/constituents/ths-stock-list",
+		Title: "同花顺指数成分股",
+		Group: "指数",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "-", Desc: "指数 thscode，形如 {ticker}.{suffix}。入参会被 trim().toUpperCase() 标准化；不接受逗号，单次仅支持一个指数。"},
+		},
+	},
+	{
+		ID:    "a-share-index.prices.historical",
+		Path:  "/api/a-share-index/prices/historical",
+		Title: "指数历史 K 线",
+		Group: "指数",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "-", Desc: "单只指数 thscode，不接受逗号。"},
+			{Name: "interval", Type: "string", Required: true, Default: "1d", Desc: "K 线周期，当前仅支持 1d（日线）。"},
+			{Name: "start", Type: "long", Required: true, Default: "-", Desc: "起始时间，毫秒 Unix 时间戳。"},
+			{Name: "end", Type: "long", Required: true, Default: "-", Desc: "结束时间，毫秒 Unix 时间戳；必须不早于 start，且查询区间需落在近 5 年的数据范围内。"},
+		},
+	},
+	{
+		ID:    "a-share-index.prices.historical-batch",
+		Path:  "/api/a-share-index/prices/historical-batch",
+		Title: "指数批量历史 K 线",
+		Group: "指数",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的完整代码，如 000001.SH,399001.SZ；最多 10 个，按去重前数量计数。"},
+			{Name: "interval", Type: "string", Required: true, Default: "—", Desc: "K 线周期，当前仅支持 1d（日线）。"},
+			{Name: "start", Type: "long", Required: true, Default: "-", Desc: "起始时间，毫秒 Unix 时间戳；须为非负毫秒时间戳。"},
+			{Name: "end", Type: "long", Required: true, Default: "-", Desc: "结束时间，毫秒 Unix 时间戳；必须不早于 start，且查询区间需落在近 5 年的数据范围内；须为非负毫秒时间戳。"},
+		},
+	},
+	{
+		ID:    "a-share-index.prices.snapshot",
+		Path:  "/api/a-share-index/prices/snapshot",
+		Title: "指数行情快照",
+		Group: "指数",
+		Limit: 100,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "-", Desc: "逗号分隔的指数 thscode 列表，如 000001.SH,399001.SZ,886042.TI,881101.TI。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "-", Desc: "与 A 股行情快照签名对齐，对本接口无效。"},
+			{Name: "offset", Type: "integer", Required: false, Default: "-", Desc: "与 A 股行情快照签名对齐，对本接口无效。"},
+		},
+	},
+	{
+		ID:    "a-share.auction.short-term-benchmark",
+		Path:  "/api/a-share/auction/short-term-benchmark",
+		Title: "短线风向标竞价基准",
+		Group: "竞价",
+		Params: []contract.FuyaoParam{
+			{Name: "date", Type: "string", Required: false, Default: "上海时区当日", Desc: "查询日期，格式 yyyy-MM-dd；缺失或传入空字符串时使用 Asia/Shanghai 当日，显式指定非交易日时不自动回退。"},
+		},
+	},
+	{
+		ID:    "a-share.auction.snapshot",
+		Path:  "/api/a-share/auction/snapshot",
+		Title: "A股集合竞价快照",
+		Group: "竞价",
+		Limit: 100,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "一个或多个 A 股 thscode，使用英文逗号分隔；单次请求当前最多 100 个，按分隔后的原始 token 数在去重前校验。服务端按请求顺序去重返回。"},
+			{Name: "stage", Type: "enum", Required: false, Default: "final", Desc: "live（实时阶段）或 final（终态）。"},
+		},
+	},
+	{
+		ID:    "a-share.calendar.trading-days",
+		Path:  "/api/a-share/calendar/trading-days",
+		Title: "交易日历",
+		Group: "基础",
+		Params: []contract.FuyaoParam{
+			{Name: "start_date", Type: "string", Required: false, Default: "两者省略时取今日减一年", Desc: "开始日期，yyyyMMdd，包含当天；与 end_date 成对提供。"},
+			{Name: "end_date", Type: "string", Required: false, Default: "两者省略时取今日", Desc: "结束日期，yyyyMMdd，包含当天；最多十个自然年。"},
+		},
+	},
+	{
+		ID:         "a-share.capital-flow.historical",
+		Path:       "/api/a-share/capital-flow/historical",
+		Title:      "资金流向历史",
+		Group:      "资金",
+		Limit:      7,
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只 A 股完整代码；不支持批量、纯代码或非 A 股标的。"},
+			{Name: "interval", Type: "enum", Required: true, Default: "—", Desc: "1m（1 分钟）或 1d（日）。"},
+			{Name: "start", Type: "long", Required: true, Default: "—", Desc: "起始时间，毫秒级 Unix 时间戳，必须大于等于 0。"},
+			{Name: "end", Type: "long", Required: true, Default: "—", Desc: "结束时间，毫秒级 Unix 时间戳，必须大于等于 start。1m 窗口最多 7 个自然日；1d 的结束日期不得晚于开始日期加 1 年。"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:         "a-share.capital-flow.snapshot",
+		Path:       "/api/a-share/capital-flow/snapshot",
+		Title:      "资金流向实时快照",
+		Group:      "资金",
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只 A 股完整代码；不支持批量、纯代码或非 A 股标的。"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "a-share.corporate-actions.adjustment-factors",
+		Path:  "/api/a-share/corporate-actions/adjustment-factors",
+		Title: "除复权数据",
+		Group: "基础",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "-", Desc: "单只标的 thscode，不接受逗号。"},
+			{Name: "from", Type: "string", Required: false, Default: "-", Desc: "事件起始日，格式 YYYY-MM-DD。"},
+			{Name: "to", Type: "string", Required: false, Default: "-", Desc: "事件截止日，格式 YYYY-MM-DD。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.balance-sheets",
+		Path:  "/api/a-share/financials/balance-sheets",
+		Title: "资产负债表",
+		Group: "财务",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只标的 thscode，不接受逗号；含交易所后缀。"},
+			{Name: "period", Type: "enum", Required: true, Default: "annual", Desc: "annual（仅 Q4 报告期）/ quarterly（每个季度末）。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "4", Desc: "最近 N 期模式，范围 [1, 20]；与 start / end 互斥。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "时间区间模式起始毫秒戳，需与 end 同传。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "时间区间模式结束毫秒戳，需满足 end >= start。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.balance-sheets-batch",
+		Path:  "/api/a-share/financials/balance-sheets-batch",
+		Title: "批量资产负债表",
+		Group: "财务",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的完整代码，如 600519.SH,000858.SZ；最多 10 个，按去重前数量计数。"},
+			{Name: "period", Type: "enum", Required: true, Default: "—", Desc: "annual（仅 Q4 报告期）/ quarterly（每个季度末）。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "4", Desc: "最近 N 期模式，范围 [1, 20]；与 start / end 互斥。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "时间区间模式起始毫秒戳，需与 end 同传；须为非负毫秒时间戳。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "时间区间模式结束毫秒戳，需满足 end >= start；须为非负毫秒时间戳。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.cash-flow-statements",
+		Path:  "/api/a-share/financials/cash-flow-statements",
+		Title: "现金流量表",
+		Group: "财务",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只标的 thscode，不接受逗号；含交易所后缀。"},
+			{Name: "period", Type: "enum", Required: true, Default: "annual", Desc: "annual（仅 Q4 报告期）/ quarterly（每个季度末）。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "4", Desc: "最近 N 期模式，范围 [1, 20]；与 start / end 互斥。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "时间区间模式起始毫秒戳，需与 end 同传。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "时间区间模式结束毫秒戳，需满足 end >= start。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.cash-flow-statements-batch",
+		Path:  "/api/a-share/financials/cash-flow-statements-batch",
+		Title: "批量现金流量表",
+		Group: "财务",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的完整代码，如 600519.SH,000858.SZ；最多 10 个，按去重前数量计数。"},
+			{Name: "period", Type: "enum", Required: true, Default: "—", Desc: "annual（仅 Q4 报告期）/ quarterly（每个季度末）。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "4", Desc: "最近 N 期模式，范围 [1, 20]；与 start / end 互斥。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "时间区间模式起始毫秒戳，需与 end 同传；须为非负毫秒时间戳。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "时间区间模式结束毫秒戳，需满足 end >= start；须为非负毫秒时间戳。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.indicators",
+		Path:  "/api/a-share/financials/indicators",
+		Title: "财务指标数据",
+		Group: "财务",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只标的 thscode，不接受逗号；含交易所后缀，如 300033.SZ。"},
+			{Name: "report", Type: "string", Required: true, Default: "—", Desc: "报告期 yyyy-1..4（1 一季报、2 中报、3 三季报、4 年报），如 2025-1。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.income-statements",
+		Path:  "/api/a-share/financials/income-statements",
+		Title: "利润表",
+		Group: "财务",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只标的 thscode，不接受逗号；含交易所后缀。"},
+			{Name: "period", Type: "enum", Required: true, Default: "annual", Desc: "annual（仅 Q4 报告期）/ quarterly（每个季度末）。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "4", Desc: "最近 N 期模式，范围 [1, 20]；与 start / end 互斥。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "时间区间模式起始毫秒戳，需与 end 同传。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "时间区间模式结束毫秒戳，需满足 end >= start。"},
+		},
+	},
+	{
+		ID:    "a-share.financials.income-statements-batch",
+		Path:  "/api/a-share/financials/income-statements-batch",
+		Title: "批量利润表",
+		Group: "财务",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的完整代码，如 600519.SH,000858.SZ；最多 10 个，按去重前数量计数。"},
+			{Name: "period", Type: "enum", Required: true, Default: "—", Desc: "annual（仅 Q4 报告期）/ quarterly（每个季度末）。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "4", Desc: "最近 N 期模式，范围 [1, 20]；与 start / end 互斥。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "时间区间模式起始毫秒戳，需与 end 同传；须为非负毫秒时间戳。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "时间区间模式结束毫秒戳，需满足 end >= start；须为非负毫秒时间戳。"},
+		},
+	},
+	{
+		ID:         "a-share.high-frequency.historical",
+		Path:       "/api/a-share/high-frequency/historical",
+		Title:      "高频历史",
+		Group:      "高频",
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只 A 股个股或指数的完整代码；不支持批量、纯代码或其他资产类型。"},
+			{Name: "interval", Type: "enum", Required: false, Default: "1d", Desc: "1d（日线）或 1m（1 分钟）。"},
+			{Name: "start", Type: "long", Required: true, Default: "—", Desc: "起始时间，正毫秒级 Unix 时间戳。日线必须为东八区交易日零点；分钟线必须与 end 处于同一交易日。"},
+			{Name: "end", Type: "long", Required: true, Default: "—", Desc: "结束时间，正毫秒级 Unix 时间戳且不早于 start。日期必须位于当前最近 30 个 A 股交易日内。"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:         "a-share.high-frequency.intraday",
+		Path:       "/api/a-share/high-frequency/intraday",
+		Title:      "单日高频分时",
+		Group:      "高频",
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只 A 股个股或指数的完整代码；不支持批量、纯代码或其他资产类型。"},
+			{Name: "date", Type: "string", Required: false, Default: "最近交易日", Desc: "指定交易日，格式为 YYYY-MM-DD，且必须位于当前最近 30 个 A 股交易日内。"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "a-share.ipo.calendar-list",
+		Path:  "/api/a-share/ipo/calendar-list",
+		Title: "新股发行与申购",
+		Group: "新股",
+		Params: []contract.FuyaoParam{
+			{Name: "market", Type: "string", Required: true, Default: "—", Desc: "适用市场：sh_sz/bj"},
+			{Name: "status", Type: "string", Required: true, Default: "—", Desc: "发行阶段：upcoming/subscribable/awaiting_listing"},
+		},
+	},
+	{
+		ID:    "a-share.prices.historical",
+		Path:  "/api/a-share/prices/historical",
+		Title: "历史 K 线",
+		Group: "行情",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "-", Desc: "单只标的 thscode，不接受逗号。多标的使用本页批量历史 K 线接口。"},
+			{Name: "interval", Type: "string", Required: true, Default: "1d", Desc: "K 线周期，当前仅支持 1d(日线)。"},
+			{Name: "start", Type: "long", Required: true, Default: "-", Desc: "起始时间，毫秒 Unix 时间戳。缺失返回 code=1001。"},
+			{Name: "end", Type: "long", Required: true, Default: "-", Desc: "结束时间，毫秒 Unix 时间戳。end - start 超过 10 年返回 code=1003。"},
+			{Name: "adjust", Type: "string", Required: false, Default: "forward", Desc: "复权方式：none / forward(前复权) / backward(后复权)。"},
+		},
+	},
+	{
+		ID:    "a-share.prices.historical-batch",
+		Path:  "/api/a-share/prices/historical-batch",
+		Title: "批量历史 K 线",
+		Group: "行情",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的完整代码，如 600519.SH,000001.SZ；最多 10 个，按去重前数量计数。"},
+			{Name: "interval", Type: "string", Required: true, Default: "—", Desc: "K 线周期：1d（日线）/ 1w（周线）/ 1mo（月线）。"},
+			{Name: "start", Type: "long", Required: true, Default: "-", Desc: "起始时间，毫秒 Unix 时间戳。缺失返回 code=1001；须为非负毫秒时间戳。"},
+			{Name: "end", Type: "long", Required: true, Default: "-", Desc: "结束时间，毫秒 Unix 时间戳。end - start 超过 10 年返回 code=1003；须为非负毫秒时间戳。"},
+			{Name: "adjust", Type: "string", Required: false, Default: "forward", Desc: "复权方式：none / forward(前复权) / backward(后复权)。"},
+		},
+	},
+	{
+		ID:    "a-share.prices.snapshot",
+		Path:  "/api/a-share/prices/snapshot",
+		Title: "行情快照",
+		Group: "行情",
+		Limit: 50,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: false, Default: "-", Desc: "逗号分隔的 thscode 列表，如 600519.SH,000001.SZ。给定时忽略分页参数。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "100", Desc: "分页大小，仅在 thscodes 省略时生效。"},
+			{Name: "offset", Type: "integer", Required: false, Default: "0", Desc: "分页偏移，仅在 thscodes 省略时生效。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.abnormal-monitor-list",
+		Path:  "/api/a-share/special-data/abnormal-monitor-list",
+		Title: "异动股票",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "state", Type: "string", Required: false, Default: "current", Desc: "current或history"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "从1开始的页码"},
+			{Name: "size", Type: "integer", Required: false, Default: "30", Desc: "每页1至30条，默认30"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.anomaly-analysis-list",
+		Path:  "/api/a-share/special-data/anomaly-analysis-list",
+		Title: "个股异动原因列表",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "tag_codes", Type: "string", Required: false, Default: "-", Desc: "异动标签，逗号分隔，多个值为 OR 关系；大小写不敏感，重复值自动去重。合法值见下方标签表。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.anomaly-analysis-stock",
+		Path:  "/api/a-share/special-data/anomaly-analysis-stock",
+		Title: "按股票查询个股异动原因",
+		Group: "特色数据",
+		Limit: 50,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "-", Desc: "逗号分隔的同花顺代码列表，支持 SH / SZ / BJ 后缀，大小写不敏感；去重前最多 50 个 token。"},
+		},
+	},
+	{
+		ID:     "a-share.special-data.auction-opportunity-dates",
+		Path:   "/api/a-share/special-data/auction-opportunity-dates",
+		Title:  "集合竞价可选交易日期",
+		Group:  "特色数据",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "a-share.special-data.auction-stock-opportunities",
+		Path:  "/api/a-share/special-data/auction-stock-opportunities",
+		Title: "集合竞价个股机会筛选",
+		Group: "特色数据",
+		Limit: 50,
+		Params: []contract.FuyaoParam{
+			{Name: "date", Type: "string", Required: false, Default: "—", Desc: "查询日期，YYYY-MM-DD；默认日期与有效范围见接口说明；须属于可用日期集合"},
+			{Name: "warn_types", Type: "string", Required: false, Default: "—", Desc: "逗号分隔的机会类型码；省略查询全部；当前类型为68710/68711/68712/68713/68714/68715/68716/68717/68718/68719/68720/68721/68722/68723/68724/68725/68726/68727"},
+			{Name: "market", Type: "string", Required: false, Default: "a_share", Desc: "适用市场：a_share/sh_sz_main/sh_a/sz_a/gem/star"},
+			{Name: "exclude_st", Type: "boolean", Required: false, Default: "false", Desc: "是否排除ST股票，默认false"},
+			{Name: "thscodes", Type: "string", Required: false, Default: "—", Desc: "逗号分隔A股标准代码，最多50个token"},
+			{Name: "sort_by", Type: "string", Required: false, Default: "warn_time", Desc: "warn_time或warn_type"},
+			{Name: "sort_order", Type: "string", Required: false, Default: "desc", Desc: "desc或asc"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "从1开始的页码"},
+			{Name: "size", Type: "integer", Required: false, Default: "20", Desc: "每页1至20条，默认20"},
+		},
+	},
+	{
+		ID:         "a-share.special-data.chip-shape-dates",
+		Path:       "/api/a-share/special-data/chip-shape-dates",
+		Title:      "筹码形态可选日期",
+		Group:      "特色数据",
+		Permission: "client",
+		Params:     []contract.FuyaoParam{},
+		Notes:      "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:         "a-share.special-data.chip-shape-stocks",
+		Path:       "/api/a-share/special-data/chip-shape-stocks",
+		Title:      "筹码形态股票筛选",
+		Group:      "特色数据",
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "shape", Type: "string", Required: true, Default: "—", Desc: "double_peak/high_position_dense/low_position_dense/low_position_locked"},
+			{Name: "date", Type: "string", Required: false, Default: "—", Desc: "查询日期，YYYY-MM-DD；默认日期与有效范围见接口说明；须属于可用日期集合"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "从1开始的页码"},
+			{Name: "size", Type: "integer", Required: false, Default: "20", Desc: "每页1至20条，默认20"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "a-share.special-data.dragon-tiger-department-classic-record",
+		Path:  "/api/a-share/special-data/dragon-tiger-department-classic-record",
+		Title: "营业部经典战绩",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "department_id", Type: "string", Required: true, Default: "—", Desc: "营业部业务标识"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.dragon-tiger-department-history",
+		Path:  "/api/a-share/special-data/dragon-tiger-department-history",
+		Title: "营业部历史上榜记录",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "department_id", Type: "string", Required: true, Default: "—", Desc: "营业部业务标识"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "从1开始的页码"},
+			{Name: "size", Type: "integer", Required: false, Default: "30", Desc: "每页1至30条，默认30"},
+			{Name: "min_net_buy_amount", Type: "integer", Required: false, Default: "—", Desc: "净买入金额档位：5000000/30000000/50000000/100000000，单位元"},
+			{Name: "sort_field", Type: "string", Required: false, Default: "trade_date", Desc: "排序字段：trade_date/change_ratio/net_buy_amount"},
+			{Name: "sort_dir", Type: "string", Required: false, Default: "desc", Desc: "asc或desc"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.dragon-tiger-list",
+		Path:  "/api/a-share/special-data/dragon-tiger-list",
+		Title: "龙虎榜数据",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "board_type", Type: "enum", Required: false, Default: "all", Desc: "榜单类型：all 全部 / org 机构榜 / hot_money 游资榜。"},
+			{Name: "date", Type: "string", Required: false, Default: "最近可用交易日", Desc: "目标交易日，格式 yyyy-MM-dd；只支持一年内数据。显式传入非交易日返回 code=1002。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.dragon-tiger-stock-institution",
+		Path:  "/api/a-share/special-data/dragon-tiger-stock-institution",
+		Title: "个股机构交易详情",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单个A股标准代码"},
+			{Name: "date", Type: "string", Required: false, Default: "—", Desc: "查询日期，YYYY-MM-DD；默认日期与有效范围见接口说明；省略使用最近已完成交易日，查询范围为一年"},
+			{Name: "range_days", Type: "integer", Required: false, Default: "—", Desc: "上榜区间，1或3；省略返回两类实际记录"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.hot-stock-list",
+		Path:  "/api/a-share/special-data/hot-stock-list",
+		Title: "A股热股榜单",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "period", Type: "enum", Required: false, Default: "day", Desc: "榜单周期：day 24 小时级别 / hour 小时级别。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "30", Desc: "返回1至100条，不足时按实际条数。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.hot-stock-list-history",
+		Path:  "/api/a-share/special-data/hot-stock-list-history",
+		Title: "历史热股排行",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "date", Type: "string", Required: true, Default: "-", Desc: "目标自然日，格式 yyyy-MM-dd；只支持一年内数据。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.hot-stock-rank-trend",
+		Path:  "/api/a-share/special-data/hot-stock-rank-trend",
+		Title: "个股排名走势",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "-", Desc: "单只 A 股标的，含交易所后缀，例如 300034.SZ。"},
+			{Name: "start_date", Type: "string", Required: true, Default: "-", Desc: "起始自然日，格式 yyyy-MM-dd。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "-", Desc: "结束自然日，格式 yyyy-MM-dd；需大于等于 start_date。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.limit-break-pool",
+		Path:  "/api/a-share/special-data/limit-break-pool",
+		Title: "炸板股票池",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "date_ms", Type: "long", Required: false, Default: "当前自然日", Desc: "交易日的上海时区零点毫秒时间戳。"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "页码，从 1 开始。"},
+			{Name: "size", Type: "integer", Required: false, Default: "50", Desc: "单页条数，范围 1..200。"},
+			{Name: "sort_field", Type: "enum", Required: false, Default: "price_change_ratio_pct", Desc: "price_change_ratio_pct / open_times / last_price / turnover_ratio_pct / turnover。"},
+			{Name: "sort_dir", Type: "enum", Required: false, Default: "desc", Desc: "asc / desc。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.limit-down-pool",
+		Path:  "/api/a-share/special-data/limit-down-pool",
+		Title: "跌停股票池",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "date_ms", Type: "long", Required: false, Default: "当前自然日", Desc: "交易日的上海时区零点毫秒时间戳。"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "页码，从 1 开始。"},
+			{Name: "size", Type: "integer", Required: false, Default: "50", Desc: "单页条数，范围 1..200。"},
+			{Name: "sort_field", Type: "enum", Required: false, Default: "last_limit_time", Desc: "last_limit_time / first_limit_time / last_price / price_change_ratio_pct / turnover_ratio_pct。"},
+			{Name: "sort_dir", Type: "enum", Required: false, Default: "desc", Desc: "asc / desc。"},
+		},
+	},
+	{
+		ID:     "a-share.special-data.limit-up-ladder",
+		Path:   "/api/a-share/special-data/limit-up-ladder",
+		Title:  "连板天梯",
+		Group:  "特色数据",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "a-share.special-data.limit-up-pool",
+		Path:  "/api/a-share/special-data/limit-up-pool",
+		Title: "涨停股票池",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "date_ms", Type: "long", Required: false, Default: "-", Desc: "查询交易日 Unix 毫秒戳（Asia/Shanghai 00:00:00）；省略时回退到服务端当前自然日。"},
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "页码，必须 >= 1。"},
+			{Name: "size", Type: "integer", Required: false, Default: "50", Desc: "分页大小，取值范围 1 到 200。"},
+			{Name: "sort_field", Type: "enum", Required: false, Default: "last_price", Desc: "排序字段：last_price / continue_day_cnt / seal_money / limit_up_time。"},
+			{Name: "sort_dir", Type: "enum", Required: false, Default: "desc", Desc: "排序方向：asc / desc。"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.limit-up-statistics",
+		Path:  "/api/a-share/special-data/limit-up-statistics",
+		Title: "涨停强度与晋级统计",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "date", Type: "string", Required: false, Default: "—", Desc: "查询日期，YYYY-MM-DD；默认日期与有效范围见接口说明；省略使用当天或最近交易日，范围为一年"},
+		},
+	},
+	{
+		ID:    "a-share.special-data.skyrocket-list",
+		Path:  "/api/a-share/special-data/skyrocket-list",
+		Title: "飙升榜",
+		Group: "特色数据",
+		Params: []contract.FuyaoParam{
+			{Name: "period", Type: "enum", Required: false, Default: "day", Desc: "榜单周期：day 日榜 / hour 小时榜。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "30", Desc: "返回1至100条，不足时按实际条数。"},
+		},
+	},
+	{
+		ID:         "a-share.special-data.turnover-prediction-snapshot",
+		Path:       "/api/a-share/special-data/turnover-prediction-snapshot",
+		Title:      "市场成交额预测",
+		Group:      "特色数据",
+		Permission: "client",
+		Params:     []contract.FuyaoParam{},
+		Notes:      "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "a-share.valuations.snapshot",
+		Path:  "/api/a-share/valuations/snapshot",
+		Title: "A股估值快照",
+		Group: "估值",
+		Limit: 100,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的 A 股 thscode 列表；每项必须为六位数字加 .SH/.SZ/.BJ；一次最多 100 个原始 token。"},
+		},
+	},
+	{
+		ID:     "dump.market-dumps.adjustment-factors.download-url",
+		Path:   "/api/dump/market-dumps/adjustment-factors/download-url",
+		Title:  "全量复权因子下载链接",
+		Group:  "全市场导出",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:     "dump.market-dumps.daily-k-10d.download-url",
+		Path:   "/api/dump/market-dumps/daily-k-10d/download-url",
+		Title:  "最近10交易日日K下载链接",
+		Group:  "全市场导出",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:     "dump.market-dumps.daily-k.download-url",
+		Path:   "/api/dump/market-dumps/daily-k/download-url",
+		Title:  "全市场10年日K下载链接",
+		Group:  "全市场导出",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:     "fund.backtest.indicators",
+		Path:   "/api/fund/backtest/indicators",
+		Title:  "基金回测可用指标",
+		Group:  "基金",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "fund.backtest.result",
+		Path:  "/api/fund/backtest/result",
+		Title: "基金在线回测",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "含市场后缀的完整基金代码，例如 000001.OF。"},
+			{Name: "buy_conditions", Type: "string", Required: true, Default: "—", Desc: "买入条件 JSON 字符串，必须是对象或数组。"},
+			{Name: "sell_conditions", Type: "string", Required: true, Default: "—", Desc: "卖出条件 JSON 字符串，必须是对象或数组。"},
+			{Name: "buy_frequency_type", Type: "string", Required: true, Default: "—", Desc: "买入频率，具体值由上游判定。"},
+			{Name: "max_buy_times", Type: "number", Required: true, Default: "—", Desc: "最大买入次数。"},
+			{Name: "per_buy_amount", Type: "number", Required: true, Default: "—", Desc: "每次买入金额。"},
+		},
+	},
+	{
+		ID:    "fund.companies.detail",
+		Path:  "/api/fund/companies/detail",
+		Title: "基金公司详情",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "company_id", Type: "string", Required: true, Default: "—", Desc: "基金公司 ID，可从基金基本资料的 company_id 获取。"},
+		},
+	},
+	{
+		ID:    "fund.corporate-actions.dividends",
+		Path:  "/api/fund/corporate-actions/dividends",
+		Title: "基金分红记录",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+		},
+	},
+	{
+		ID:    "fund.diagnostics.detail",
+		Path:  "/api/fund/diagnostics/detail",
+		Title: "基金诊断详情",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+		},
+	},
+	{
+		ID:         "fund.etf-flow.net-inflow-historical",
+		Path:       "/api/fund/etf-flow/net-inflow-historical",
+		Title:      "宽基ETF申购净流入",
+		Group:      "基金",
+		Permission: "client",
+		Params:     []contract.FuyaoParam{},
+		Notes:      "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "fund.financials.balance-sheets",
+		Path:  "/api/fund/financials/balance-sheets",
+		Title: "基金资产负债表",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀。"},
+		},
+	},
+	{
+		ID:    "fund.financials.income-statements",
+		Path:  "/api/fund/financials/income-statements",
+		Title: "基金利润表",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀。"},
+		},
+	},
+	{
+		ID:    "fund.financials.indicators",
+		Path:  "/api/fund/financials/indicators",
+		Title: "基金财务指标",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀。"},
+		},
+	},
+	{
+		ID:    "fund.holders.detail",
+		Path:  "/api/fund/holders/detail",
+		Title: "基金持有人结构",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀。"},
+			{Name: "merge_scope", Type: "enum", Required: false, Default: "all", Desc: "all（分别返回合并/独立份额的最新记录）/ merged（A/C 等份额合并披露）/ separate（当前份额独立披露）。"},
+		},
+	},
+	{
+		ID:    "fund.holders.top",
+		Path:  "/api/fund/holders/top",
+		Title: "基金前十大持有人",
+		Group: "基金",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "服务端默认", Desc: "返回条数，最大为 10。"},
+		},
+	},
+	{
+		ID:    "fund.managers.detail",
+		Path:  "/api/fund/managers/detail",
+		Title: "基金经理详情",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "manager_id", Type: "string", Required: true, Default: "—", Desc: "基金经理 ID。"},
+		},
+	},
+	{
+		ID:    "fund.managers.experience",
+		Path:  "/api/fund/managers/experience",
+		Title: "从业经历",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "manager_id", Type: "string", Required: true, Default: "—", Desc: "基金经理 ID。"},
+		},
+	},
+	{
+		ID:    "fund.managers.investment-style",
+		Path:  "/api/fund/managers/investment-style",
+		Title: "投资风格",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "manager_id", Type: "string", Required: true, Default: "—", Desc: "基金经理 ID。"},
+		},
+	},
+	{
+		ID:    "fund.managers.performance",
+		Path:  "/api/fund/managers/performance",
+		Title: "基金经理业绩",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "manager_id", Type: "string", Required: true, Default: "—", Desc: "基金经理 ID。"},
+			{Name: "range", Type: "enum", Required: true, Default: "—", Desc: "month / tmonth / year / nowyear / now。"},
+		},
+	},
+	{
+		ID:    "fund.market.historical",
+		Path:  "/api/fund/market/historical",
+		Title: "场内基金历史日线行情",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "单只 ETF 的完整 thscode，必须保留市场后缀；不接受逗号分隔的多个值。"},
+			{Name: "interval", Type: "string", Required: false, Default: "1d", Desc: "K 线周期，当前仅支持 1d（日线）。"},
+			{Name: "start", Type: "long", Required: true, Default: "—", Desc: "起始时间，毫秒级 Unix 时间戳。"},
+			{Name: "end", Type: "long", Required: true, Default: "—", Desc: "结束时间，毫秒级 Unix 时间戳；必须不早于 start，且窗口最长 5 个自然年。"},
+		},
+	},
+	{
+		ID:    "fund.market.historical-batch",
+		Path:  "/api/fund/market/historical-batch",
+		Title: "场内基金批量历史日线行情",
+		Group: "基金",
+		Limit: 10,
+		Params: []contract.FuyaoParam{
+			{Name: "thscodes", Type: "string", Required: true, Default: "—", Desc: "英文逗号分隔的完整代码，如 510300.SH,159915.SZ；最多 10 个，按去重前数量计数。"},
+			{Name: "interval", Type: "string", Required: false, Default: "1d", Desc: "K 线周期，当前仅支持 1d（日线）。"},
+			{Name: "start", Type: "long", Required: true, Default: "—", Desc: "起始时间，毫秒级 Unix 时间戳；须为非负毫秒时间戳。"},
+			{Name: "end", Type: "long", Required: true, Default: "—", Desc: "结束时间，毫秒级 Unix 时间戳；必须不早于 start，且窗口最长 5 个自然年；须为非负毫秒时间戳。"},
+		},
+	},
+	{
+		ID:    "fund.market.snapshot",
+		Path:  "/api/fund/market/snapshot",
+		Title: "场内基金行情快照",
+		Group: "基金",
+		Limit: 100,
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "1 至 100 个完整 ETF/LOF 代码，英文逗号分隔，如 510300.SH,161725.SZ；先检查原始项数，再去除首尾空白、转大写并稳定去重。"},
+		},
+	},
+	{
+		ID:    "fund.news.article-list",
+		Path:  "/api/fund/news/article-list",
+		Title: "基金资讯列表",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "服务端默认", Desc: "返回条数。"},
+			{Name: "offset", Type: "string", Required: false, Default: "—", Desc: "不透明翻页游标；下一页应原样回传上一页的 data.offset。"},
+		},
+	},
+	{
+		ID:    "fund.offerings.list",
+		Path:  "/api/fund/offerings/list",
+		Title: "基金募集列表",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "subscribe", Type: "enum", Required: true, Default: "—", Desc: "active（当前募集）或 upcoming（即将募集）。"},
+		},
+	},
+	{
+		ID:    "fund.performance.drawdowns",
+		Path:  "/api/fund/performance/drawdowns",
+		Title: "基金最大回撤",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+		},
+	},
+	{
+		ID:    "fund.performance.indicators-historical",
+		Path:  "/api/fund/performance/indicators-historical",
+		Title: "基金历史业绩指标",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "start", Type: "long", Required: true, Default: "—", Desc: "起始时间，毫秒 Unix 时间戳。"},
+			{Name: "end", Type: "long", Required: true, Default: "—", Desc: "结束时间，毫秒 Unix 时间戳。"},
+		},
+	},
+	{
+		ID:    "fund.performance.nav",
+		Path:  "/api/fund/performance/nav",
+		Title: "基金净值",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀。"},
+			{Name: "range", Type: "string", Required: false, Default: "最新一条", Desc: "week / month / tmonth / hyear / year / twoyear / tyear / fyear。"},
+			{Name: "nav_type", Type: "string", Required: false, Default: "unit,adj", Desc: "unit（单位净值）/ adj（复权净值）/ unit,adj（同时返回）。"},
+		},
+	},
+	{
+		ID:    "fund.performance.returns",
+		Path:  "/api/fund/performance/returns",
+		Title: "基金区间收益",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.asset-allocation",
+		Path:  "/api/fund/portfolio/asset-allocation",
+		Title: "基金资产配置",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.bond-history",
+		Path:  "/api/fund/portfolio/bond-history",
+		Title: "基金历史债券持仓",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "report_type", Type: "string", Required: true, Default: "—", Desc: "报告类型。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "—", Desc: "报告截止日期，格式 yyyy-MM-dd。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.bond-report-dates",
+		Path:  "/api/fund/portfolio/bond-report-dates",
+		Title: "基金债券持仓报告日期",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "report_type", Type: "string", Required: false, Default: "—", Desc: "报告类型。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.holdings",
+		Path:  "/api/fund/portfolio/holdings",
+		Title: "基金重仓持仓",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀，如 025480.OF。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.industry-allocation",
+		Path:  "/api/fund/portfolio/industry-allocation",
+		Title: "基金行业配置",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.stock-history",
+		Path:  "/api/fund/portfolio/stock-history",
+		Title: "基金历史股票持仓",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "report_type", Type: "string", Required: true, Default: "—", Desc: "报告类型。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "—", Desc: "报告截止日期，格式 yyyy-MM-dd。"},
+		},
+	},
+	{
+		ID:    "fund.portfolio.stock-report-dates",
+		Path:  "/api/fund/portfolio/stock-report-dates",
+		Title: "基金股票持仓报告日期",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode。"},
+			{Name: "report_type", Type: "string", Required: false, Default: "—", Desc: "报告类型。"},
+		},
+	},
+	{
+		ID:    "fund.profile.detail",
+		Path:  "/api/fund/profile/detail",
+		Title: "基金基本资料",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整基金 thscode，必须保留市场后缀，如 025480.OF / 510300.SH。"},
+		},
+	},
+	{
+		ID:    "fund.quota.list",
+		Path:  "/api/fund/quota/list",
+		Title: "QDII额度列表",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "tab", Type: "string", Required: true, Default: "—", Desc: "分类数组 JSON 字符串，例如 [\"remen\"]；数组元素：remen（热门）、meiguo（美国）、yatai（亚太）、ouzhou（欧洲）。"},
+			{Name: "buy", Type: "boolean", Required: false, Default: "—", Desc: "可购状态过滤；省略时不向上游注入默认值。"},
+		},
+	},
+	{
+		ID:    "fund.quota.summary",
+		Path:  "/api/fund/quota/summary",
+		Title: "QDII额度汇总",
+		Group: "基金",
+		Params: []contract.FuyaoParam{
+			{Name: "tab", Type: "string", Required: true, Default: "—", Desc: "分类数组 JSON 字符串，例如 [\"nazhi100\"]；数组元素：nazhi100（纳指100）、meigukeji（美股科技）、biaopu（标普）、yatai（亚太）、ouzhou（欧洲）。"},
+		},
+	},
+	{
+		ID:    "futures.basis.historical",
+		Path:  "/api/futures/basis/historical",
+		Title: "期货历史基差",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+			{Name: "spot_indicator_id", Type: "string", Required: false, Default: "—", Desc: "可选现货指标 ID；省略时使用上游默认口径。"},
+		},
+	},
+	{
+		ID:     "futures.basis.main-continuous-latest",
+		Path:   "/api/futures/basis/main-continuous-latest",
+		Title:  "期货主连最新基差",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "futures.calendar.session-timeline",
+		Path:  "/api/futures/calendar/session-timeline",
+		Title: "期货交易时间轴",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+		},
+	},
+	{
+		ID:    "futures.calendar.trading-schedule",
+		Path:  "/api/futures/calendar/trading-schedule",
+		Title: "期货交易日",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+			{Name: "start_date", Type: "string", Required: true, Default: "—", Desc: "开始日期，格式 yyyy-MM-dd。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "—", Desc: "结束日期，不早于开始日期。"},
+		},
+	},
+	{
+		ID:     "futures.contracts.commodity-index-list",
+		Path:   "/api/futures/contracts/commodity-index-list",
+		Title:  "商品指数合约列表",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "futures.contracts.detail",
+		Path:  "/api/futures/contracts/detail",
+		Title: "期货合约详情",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+		},
+	},
+	{
+		ID:    "futures.contracts.list",
+		Path:  "/api/futures/contracts/list",
+		Title: "期货合约基础信息列表",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "limit", Type: "integer", Required: false, Default: "100", Desc: "单页条数，范围 1-1000。"},
+			{Name: "offset", Type: "integer", Required: false, Default: "0", Desc: "分页偏移，最小为 0。"},
+		},
+	},
+	{
+		ID:     "futures.contracts.main-continuous-list",
+		Path:   "/api/futures/contracts/main-continuous-list",
+		Title:  "期货主连资料",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:     "futures.contracts.main-list",
+		Path:   "/api/futures/contracts/main-list",
+		Title:  "期货主力合约",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:     "futures.contracts.secondary-main-list",
+		Path:   "/api/futures/contracts/secondary-main-list",
+		Title:  "期货次主力合约",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:         "futures.fundamentals.indicators-historical",
+		Path:       "/api/futures/fundamentals/indicators-historical",
+		Title:      "期货F10基本面指标历史数据",
+		Group:      "期货",
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "indicator_ids", Type: "string", Required: true, Default: "—", Desc: "1～5 个逗号分隔的指标 ID。"},
+			{Name: "start_date", Type: "string", Required: true, Default: "—", Desc: "开始日期，格式 yyyy-MM-dd。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "—", Desc: "结束日期，不早于开始日期，区间最长 5 年。"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:     "futures.positions.company-list",
+		Path:   "/api/futures/positions/company-list",
+		Title:  "期货公司列表",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "futures.positions.company-variety-daily",
+		Path:  "/api/futures/positions/company-variety-daily",
+		Title: "期货公司品种日持仓",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "date", Type: "string", Required: true, Default: "—", Desc: "交易日期，格式 yyyy-MM-dd。"},
+			{Name: "varieties", Type: "string", Required: true, Default: "—", Desc: "1～5 个逗号分隔的大写期货品种代码。"},
+		},
+	},
+	{
+		ID:    "futures.positions.contract-daily",
+		Path:  "/api/futures/positions/contract-daily",
+		Title: "期货公司合约日持仓",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+			{Name: "variety", Type: "string", Required: true, Default: "—", Desc: "大写品种代码，须与 thscode 所属品种一致。"},
+			{Name: "date", Type: "string", Required: true, Default: "—", Desc: "交易日期，格式 yyyy-MM-dd。"},
+		},
+	},
+	{
+		ID:    "futures.positions.contract-historical",
+		Path:  "/api/futures/positions/contract-historical",
+		Title: "期货公司合约历史持仓",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+			{Name: "variety", Type: "string", Required: true, Default: "—", Desc: "大写品种代码，须与合约一致。"},
+			{Name: "company", Type: "string", Required: true, Default: "—", Desc: "期货公司名称。"},
+			{Name: "start_date", Type: "string", Required: true, Default: "—", Desc: "开始日期；须位于调用日前一年内，结束日固定为调用日。"},
+		},
+	},
+	{
+		ID:    "futures.positions.variety-daily",
+		Path:  "/api/futures/positions/variety-daily",
+		Title: "期货品种日持仓",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "date", Type: "string", Required: true, Default: "—", Desc: "交易日期，格式 yyyy-MM-dd。"},
+		},
+	},
+	{
+		ID:    "futures.prices.daily",
+		Path:  "/api/futures/prices/daily",
+		Title: "期货K线",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约或期货商品指数完整同花顺代码。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "与 end 成对提供的正毫秒时间戳；两者均省略时查询最近 100 根。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "与 start 成对提供，且不早于 start。"},
+			{Name: "time_period", Type: "enum", Required: false, Default: "—", Desc: "端外仅允许 day_1；AI 客户端内可使用 min_1、min_10、hour_1、day_1、week_1、month_1、quarter_1、year_1。"},
+		},
+	},
+	{
+		ID:    "futures.prices.intraday",
+		Path:  "/api/futures/prices/intraday",
+		Title: "期货分时",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约或期货商品指数完整同花顺代码。"},
+			{Name: "session", Type: "enum", Required: false, Default: "—", Desc: "行情阶段：pre_market-盘前、intraday-盘中、post_market-盘后；省略时使用 intraday。"},
+			{Name: "trade_date", Type: "string", Required: false, Default: "—", Desc: "端外仅允许 0；AI 客户端内可传 0 或合法历史交易日 yyyyMMdd。"},
+		},
+	},
+	{
+		ID:     "futures.varieties.list",
+		Path:   "/api/futures/varieties/list",
+		Title:  "期货品种资料",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:     "futures.variety-plates.list",
+		Path:   "/api/futures/variety-plates/list",
+		Title:  "期货品种板块",
+		Group:  "期货",
+		Params: []contract.FuyaoParam{},
+	},
+	{
+		ID:    "futures.warehouse-receipts.historical",
+		Path:  "/api/futures/warehouse-receipts/historical",
+		Title: "期货历史仓单",
+		Group: "期货",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期货合约完整同花顺代码。"},
+			{Name: "start_date", Type: "string", Required: true, Default: "—", Desc: "开始日期，格式 yyyy-MM-dd。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "—", Desc: "结束日期，不早于开始日期。"},
+		},
+	},
+	{
+		ID:    "hk-share.ipo.application-list",
+		Path:  "/api/hk-share/ipo/application-list",
+		Title: "港股新股递表记录",
+		Group: "港股",
+		Params: []contract.FuyaoParam{
+			{Name: "page", Type: "integer", Required: false, Default: "1", Desc: "从1开始的页码"},
+		},
+	},
+	{
+		ID:    "hk-share.ipo.calendar-list",
+		Path:  "/api/hk-share/ipo/calendar-list",
+		Title: "港股认购与待上市日历",
+		Group: "港股",
+		Params: []contract.FuyaoParam{
+			{Name: "status", Type: "string", Required: true, Default: "—", Desc: "发行阶段：subscribable/awaiting_listing"},
+		},
+	},
+	{
+		ID:    "hk-share.ipo.issue-detail",
+		Path:  "/api/hk-share/ipo/issue-detail",
+		Title: "港股新股发行详情",
+		Group: "港股",
+		Params: []contract.FuyaoParam{
+			{Name: "issue_code", Type: "string", Required: true, Default: "—", Desc: "日历中的发行记录标识，最多32字符"},
+		},
+	},
+	{
+		ID:    "meta.tickers.list",
+		Path:  "/api/meta/tickers/list",
+		Title: "标的列表获取",
+		Group: "基础",
+		Limit: 10000,
+		Params: []contract.FuyaoParam{
+			{Name: "asset_type", Type: "string", Required: false, Default: "全部类型", Desc: "规范化资产类型，支持单值或逗号分隔多值；省略时返回全部类型。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "1000", Desc: "单页条数，最大 10000。"},
+			{Name: "offset", Type: "integer", Required: false, Default: "0", Desc: "分页偏移。"},
+		},
+	},
+	{
+		ID:    "meta.tickers.search",
+		Path:  "/api/meta/tickers/search",
+		Title: "标的检索",
+		Group: "基础",
+		Limit: 50,
+		Params: []contract.FuyaoParam{
+			{Name: "q", Type: "string", Required: true, Default: "-", Desc: "搜索关键词：完整 thscode、ticker 代码或中英文名称（支持子串匹配）。"},
+			{Name: "exchange", Type: "string", Required: false, Default: "-", Desc: "交易所过滤；支持证券交易所与 CFFEX、SHFE、INE、DCE、CZCE、GFEX、SSE、SZSE。"},
+			{Name: "asset_type", Type: "string", Required: false, Default: "-", Desc: "规范化资产类型，支持单值或逗号分隔多值；完整枚举见下方。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "10", Desc: "返回上限，最大 50。"},
+		},
+	},
+	{
+		ID:    "news.anomaly.analysis",
+		Path:  "/api/news/anomaly/analysis",
+		Title: "日期范围异动解读",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "begin_date", Type: "string", Required: true, Default: "—", Desc: "开始日期，格式yyyy-MM-dd。"},
+			{Name: "end_date", Type: "string", Required: true, Default: "—", Desc: "结束日期，格式yyyy-MM-dd。"},
+			{Name: "thscode", Type: "string", Required: false, Default: "—", Desc: "按上游要求提供的同花顺标的编码，格式待核实；省略查询全量。"},
+		},
+	},
+	{
+		ID:    "news.article.detail",
+		Path:  "/api/news/article/detail",
+		Title: "资讯详情",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "client_type", Type: "string", Required: true, Default: "—", Desc: "客户端类型：WEB、WEB_ENCRYPTED、PC、PC_LIST，不区分大小写。"},
+			{Name: "encoded_seq", Type: "string", Required: true, Default: "—", Desc: "密文资讯标识。"},
+		},
+	},
+	{
+		ID:         "news.events.search",
+		Path:       "/api/news/events/search",
+		Title:      "资讯事件库",
+		Group:      "资讯",
+		Limit:      200,
+		Permission: "client",
+		Params: []contract.FuyaoParam{
+			{Name: "query", Type: "string", Required: false, Default: "—", Desc: "标题或正文关键词，最多 200 个字符。"},
+			{Name: "search_param", Type: "enum", Required: false, Default: "event_name", Desc: "检索域：event_name（标题）或 event_summary（正文摘要）。"},
+			{Name: "standard_start_time", Type: "string", Required: false, Default: "—", Desc: "标准时间下界，格式 yyyy-MM-dd。"},
+			{Name: "standard_end_time", Type: "string", Required: false, Default: "—", Desc: "标准时间上界，格式 yyyy-MM-dd。"},
+			{Name: "event_grading_score", Type: "string", Required: false, Default: "—", Desc: "逗号分隔的评级，如 A,B。"},
+			{Name: "related_industry_code", Type: "string", Required: false, Default: "—", Desc: "逗号分隔的关联行业代码。"},
+			{Name: "related_concept_code", Type: "string", Required: false, Default: "—", Desc: "逗号分隔的关联概念代码。"},
+			{Name: "size", Type: "integer", Required: false, Default: "20", Desc: "返回条数，范围 1-100。"},
+		},
+		Notes: "同花顺AI客户端专用：外部 API Key 实际返回 code=2004，工具需优雅降级为说明而非报错。",
+	},
+	{
+		ID:    "news.flash.list",
+		Path:  "/api/news/flash/list",
+		Title: "快讯列表",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "tag_id", Type: "integer", Required: true, Default: "—", Desc: "快讯栏目ID。"},
+			{Name: "seq", Type: "string", Required: true, Default: "—", Desc: "不透明序号；快讯首屏传字符串0。"},
+		},
+	},
+	{
+		ID:    "news.flash.refresh",
+		Path:  "/api/news/flash/refresh",
+		Title: "快讯刷新",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "tag_id", Type: "integer", Required: true, Default: "—", Desc: "快讯栏目ID。"},
+			{Name: "seq", Type: "string", Required: true, Default: "—", Desc: "不透明序号；快讯首屏传字符串0。"},
+			{Name: "create_time_ms", Type: "integer", Required: true, Default: "—", Desc: "客户端已知快讯创建时间，毫秒值须能整除1000。"},
+		},
+	},
+	{
+		ID:    "news.notice.detail",
+		Path:  "/api/news/notice/detail",
+		Title: "公告详情与解读",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "seq", Type: "string", Required: true, Default: "—", Desc: "不透明序号；快讯首屏传字符串0。"},
+		},
+	},
+	{
+		ID:    "news.stock.timeline-list",
+		Path:  "/api/news/stock/timeline-list",
+		Title: "个股分时新闻",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "完整同花顺代码，例如300033.SZ。"},
+			{Name: "offset", Type: "string", Required: true, Default: "—", Desc: "分页偏移量，首屏first；后续原样回传。"},
+			{Name: "size", Type: "integer", Required: false, Default: "—", Desc: "每页条数，范围1至100；省略使用上游行为。"},
+		},
+	},
+	{
+		ID:    "news.topic.hot-list",
+		Path:  "/api/news/topic/hot-list",
+		Title: "热门深度专题",
+		Group: "资讯",
+		Params: []contract.FuyaoParam{
+			{Name: "tab_id", Type: "integer", Required: true, Default: "—", Desc: "热门专题栏目ID。"},
+			{Name: "cursor", Type: "string", Required: false, Default: "—", Desc: "分页游标，后续查询原样回传。"},
+			{Name: "limit", Type: "integer", Required: false, Default: "10", Desc: "每页条数，范围1至10。"},
+			{Name: "important_only", Type: "boolean", Required: false, Default: "false", Desc: "是否只查询重要内容。"},
+		},
+	},
+	{
+		ID:    "options.calendar.session-timeline",
+		Path:  "/api/options/calendar/session-timeline",
+		Title: "期权交易时间轴",
+		Group: "期权",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期权合约完整同花顺代码。"},
+		},
+	},
+	{
+		ID:    "options.contracts.detail",
+		Path:  "/api/options/contracts/detail",
+		Title: "期权合约详情",
+		Group: "期权",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期权合约完整同花顺代码。"},
+		},
+	},
+	{
+		ID:    "options.contracts.list",
+		Path:  "/api/options/contracts/list",
+		Title: "期权合约基础信息列表",
+		Group: "期权",
+		Params: []contract.FuyaoParam{
+			{Name: "limit", Type: "integer", Required: false, Default: "100", Desc: "单页条数，范围 1-1000。"},
+			{Name: "offset", Type: "integer", Required: false, Default: "0", Desc: "分页偏移，最小为 0。"},
+		},
+	},
+	{
+		ID:    "options.prices.daily",
+		Path:  "/api/options/prices/daily",
+		Title: "期权K线",
+		Group: "期权",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期权合约完整同花顺代码。"},
+			{Name: "start", Type: "long", Required: false, Default: "—", Desc: "与 end 成对提供的正毫秒时间戳；两者均省略时查询最近 100 根。"},
+			{Name: "end", Type: "long", Required: false, Default: "—", Desc: "与 start 成对提供的正毫秒时间戳，且不早于 start。"},
+			{Name: "time_period", Type: "enum", Required: false, Default: "—", Desc: "端外仅允许 day_1；AI 客户端内可使用 min_1、min_10、hour_1、day_1、week_1、month_1、quarter_1、year_1。"},
+		},
+	},
+	{
+		ID:    "options.prices.intraday",
+		Path:  "/api/options/prices/intraday",
+		Title: "期权分时",
+		Group: "期权",
+		Params: []contract.FuyaoParam{
+			{Name: "thscode", Type: "string", Required: true, Default: "—", Desc: "期权合约完整同花顺代码。"},
+			{Name: "session", Type: "enum", Required: false, Default: "—", Desc: "行情阶段：pre_market-盘前、intraday-盘中、post_market-盘后；省略时使用 intraday。"},
+			{Name: "trade_date", Type: "string", Required: false, Default: "—", Desc: "端外仅允许 0；AI 客户端内可传 0 或合法历史交易日 yyyyMMdd。"},
+		},
+	},
+	{
+		ID:     "options.varieties.list",
+		Path:   "/api/options/varieties/list",
+		Title:  "期权品种资料",
+		Group:  "期权",
+		Params: []contract.FuyaoParam{},
+	},
+}

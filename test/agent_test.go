@@ -234,19 +234,23 @@ func TestAgentLoopStopsAtStepLimit(t *testing.T) {
 		t.Fatalf("Run 失败: %v", err)
 	}
 	reqs := llm.snapshot()
-	if len(reqs) != 3 {
-		t.Fatalf("步数上限 3 时模型应被调用 3 次，实际 %d 次（说明循环没被拦住）", len(reqs))
+	// 3 轮 ReAct + 1 次不带工具的收口调用（步数耗尽后仍要产出报告）。
+	if len(reqs) != 4 {
+		t.Fatalf("步数上限 3 时应有 3 轮 ReAct + 1 次收口调用，实际 %d 次（说明循环没被拦住或没做收口）", len(reqs))
+	}
+	if len(reqs[3].Tools) != 0 {
+		t.Fatalf("收口调用不能带工具清单，实际 %d 个", len(reqs[3].Tools))
 	}
 	if rep.Steps != 3 {
-		t.Fatalf("报告步数应为 3，实际 %d", rep.Steps)
+		t.Fatalf("报告步数应为 3（收口调用不计步），实际 %d", rep.Steps)
 	}
 	// 口径：MaxToolCalls 是"模型轮次上限"。到达上限的那一轮虽然模型仍请求了工具，
 	// 但循环已经在 model 节点后判定 exhausted，不再执行该请求（避免越界花钱）。
 	// 因此 3 轮模型调用 = 2 次真实工具执行，这个边界必须在测试里钉死，避免以后被改坏。
 	if got := h.kernel.audit.countIf(func(e contract.AuditEvent) bool {
 		return e.Kind == "tool" && e.Action == "market.quote"
-	}); got != len(reqs)-1 {
-		t.Fatalf("上限轮次的工具请求不应执行：期望 %d 次执行，实际 %d", len(reqs)-1, got)
+	}); got != rep.Steps-1 {
+		t.Fatalf("上限轮次的工具请求不应执行：期望 %d 次执行，实际 %d", rep.Steps-1, got)
 	}
 	// 被拦下时必须留下可见原因，而不是静默截断
 	if !strings.Contains(rep.Report, "最大步数") && !strings.Contains(rep.Report, "已停机") {
@@ -256,8 +260,11 @@ func TestAgentLoopStopsAtStepLimit(t *testing.T) {
 
 // token 预算超了也要停，并且原因可读。
 func TestAgentLoopStopsAtTokenBudget(t *testing.T) {
-	llm := newFakeLLM(toolCallReply(40, "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`))
-	llm.repeatLast = true
+	llm := newFakeLLM(
+		toolCallReply(40, "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+		toolCallReply(40, "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+		textReply("## 结论\n预算耗尽，量比按量/额口径看。\n## 依据\n- market.quote 返回 12.34\n## 不确定性\n- 只取到一次快照\n## 风险提示\n- 仅作研究参考", 20),
+	)
 	h := newAgentHarness(t, llm, contract.Policy{MaxToolCalls: 20, MaxTokensPerRun: 50})
 
 	rep, err := h.runtime.Run(context.Background(), "chat", "解释一下量比口径", "")
@@ -265,11 +272,25 @@ func TestAgentLoopStopsAtTokenBudget(t *testing.T) {
 		t.Fatalf("Run 失败: %v", err)
 	}
 	reqs := llm.snapshot()
-	if len(reqs) != 2 {
-		t.Fatalf("token 预算 50、每次 40 时应在第 2 次调用后停止，实际调用 %d 次", len(reqs))
+	// token 预算 50、每次 40：第 2 次调用后停机，再补一次不带工具的收口调用。
+	if len(reqs) != 3 {
+		t.Fatalf("token 预算 50、每次 40 时应有 2 次 ReAct + 1 次收口调用，实际调用 %d 次", len(reqs))
 	}
-	if rep.Usage.TotalTokens != 80 {
-		t.Fatalf("已用 token 应记录为 80，实际 %d", rep.Usage.TotalTokens)
+	if len(reqs[2].Tools) != 0 {
+		t.Fatalf("收口调用不能带工具清单，实际 %d 个", len(reqs[2].Tools))
+	}
+	lastText := ""
+	for _, m := range reqs[2].Messages {
+		lastText += m.Content
+	}
+	if !strings.Contains(lastText, "market.quote") {
+		t.Fatalf("收口调用应带上已获得的工具结果，实际: %.600s", lastText)
+	}
+	if rep.Usage.TotalTokens != 100 {
+		t.Fatalf("已用 token 应记录为 40+40+20=100，实际 %d", rep.Usage.TotalTokens)
+	}
+	if !strings.Contains(rep.Report, "## 结论") || !strings.Contains(rep.Report, "量比") {
+		t.Fatalf("预算耗尽后报告正文应包含收口结论，实际: %q", rep.Report)
 	}
 	if !strings.Contains(rep.Report, "token") && !strings.Contains(rep.Report, "预算") {
 		t.Fatalf("超出 token 预算应在结论里说明，实际: %q", rep.Report)
@@ -321,15 +342,15 @@ func TestAgentLoopUnknownToolNameDoesNotBreakLoop(t *testing.T) {
 func TestAgentLoopWithoutLLM(t *testing.T) {
 	h := newAgentHarness(t, newFakeLLM(), contract.Policy{})
 	h.runtime = agent.NewRuntime(agent.RuntimeOptions{
-		LLM:    nil,
-		Guard:  h.kernel.guard,
-		Audit:  h.kernel.audit,
-		Events: plugin.NewBus(),
-		Policy: contract.Policy{MaxToolCalls: 4, MaxTokensPerRun: 1000},
-		Store:  h.kernel.store,
+		LLM:     nil,
+		Guard:   h.kernel.guard,
+		Audit:   h.kernel.audit,
+		Events:  plugin.NewBus(),
+		Policy:  contract.Policy{MaxToolCalls: 4, MaxTokensPerRun: 1000},
+		Store:   h.kernel.store,
 		Gateway: progressive.NewGateway(h.kernel.k, h.kernel.guard, h.kernel.audit, plugin.RiskNetwork),
-		Clock:  time.Now,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Clock:   time.Now,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	rep, err := h.runtime.Run(context.Background(), "chat", "随便问问", "")
 	if err == nil && rep.Error == "" {

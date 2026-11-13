@@ -17,6 +17,7 @@ import (
 //	10 = 现价        13 = 成交量(股)   19 = 成交额(元)
 //	199112 = 涨跌幅%  264648 = 涨跌额  1968584 = 换手%
 //	526792 = 振幅%   1771976 = 量比
+//	37 = 上涨家数  38 = 平盘家数  39 = 下跌家数（只有指数才有；**只覆盖单一市场**）
 //
 // 校验样例（2026-11-10 收盘，600000）：现价 10.20、昨收 10.10、开 10.06、
 // 高 10.24、低 10.00、量 47,782,652 股、额 485,074,220 元 —— 与腾讯
@@ -37,6 +38,13 @@ const (
 	thsItemTurnover    = "1968584"
 	thsItemAmplitude   = "526792"
 	thsItemVolumeRatio = "1771976"
+	// 指数专属的涨跌家数：37 上涨 / 38 下跌 / 39 平盘。
+	// 实测（2026-11-11 收盘，hs_1A0001）37=2360、38=1656、39=622，
+	// 与沪市「涨多跌少 + 平盘几百只」的常识一致；若按 38=平盘 解读会得到 1656 只平盘，明显不合理。
+	// 注意它只统计该指数所属市场（上证 -> 沪市），不是全市场口径，只能作降级用。
+	thsItemUpCount   = "37"
+	thsItemDownCount = "38"
+	thsItemFlatCount = "39"
 )
 
 // 同花顺 marketid → 交易所（实测：17 沪股、33 深股、16 沪指、32 深指、48 板块）。
@@ -67,8 +75,12 @@ type thsRealhead struct {
 	VolumeRatio float64
 	LimitUp     float64
 	LimitDown   float64
-	Time        string // RFC3339（+08:00）
-	Status      string // 同花顺 stockStatus 原值：闭市 / -- 等
+	// Up/Flat/Down 是指数口径的涨跌家数（个股没有这三个字段，值为 0）。
+	Up     int
+	Flat   int
+	Down   int
+	Time   string // RFC3339（+08:00）
+	Status string // 同花顺 stockStatus 原值：闭市 / -- 等
 }
 
 // parseTHSRealhead 解析 realhead JSONP。code 用于判定类别与成交量单位。
@@ -109,6 +121,9 @@ func parseTHSRealhead(body []byte, code Code) (thsRealhead, error) {
 		LimitUp:     numOrZero(items[thsItemLimitUp]),
 		LimitDown:   numOrZero(items[thsItemLimitDown]),
 		VolumeRatio: numOrZero(items[thsItemVolumeRatio]),
+		Up:          int(numOrZero(items[thsItemUpCount])),
+		Flat:        int(numOrZero(items[thsItemFlatCount])),
+		Down:        int(numOrZero(items[thsItemDownCount])),
 		Status:      strings.TrimSpace(items["stockStatus"]),
 	}
 	if name, ok := items["name"]; ok {
@@ -175,7 +190,7 @@ type thsLineData struct {
 // parseTHSLine 解析 /v6/line/<symbol>/<period>/<year|last>.js。
 //
 // 每行字段：日期,开,高,低,收,成交量(股),成交额(元),换手率,...
-// 注意顺序是「开高低收」，与东财的「开收高低」不同，写错就会把高低点算反。
+// 注意顺序是「开高低收」，与腾讯/新浪 K 线的「开收高低」不同，写错就会把高低点算反。
 func parseTHSLine(body []byte, code Code) (thsLineData, error) {
 	payload, err := unwrapJSONP(body)
 	if err != nil {

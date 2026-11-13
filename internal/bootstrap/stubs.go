@@ -91,18 +91,26 @@ type stubGuard struct {
 
 func defaultPolicy(cfg Config) contract.Policy {
 	return contract.Policy{
+		// 只放行真正取数/推理的主机：同花顺、腾讯、新浪、DeepSeek、OpenAI。
+		// 东方财富（eastmoney.com 全系）已从数据层移除，白名单同步收紧——
+		// 留着域名等于给"以后又接回去"留后门。
 		NetworkAllowlist: []string{
-			"10jqka.com.cn", "eastmoney.com", "gtimg.cn",
+			"10jqka.com.cn", "gtimg.cn",
 			"sinajs.cn", "sina.com.cn", "sina.cn", "hexun.com",
+			// 同花顺官方金融数据 API（fuyao.aicubes.cn）：官方源优先、现有链路兜底。
+			"aicubes.cn",
 			"deepseek.com", "openai.com",
 		},
-		PathRoots:        []string{cfg.DataDir},
-		AllowExec:        false,
-		MaxReqPerMin:     120,
-		MaxToolCalls:     30,
-		// 盘前/复盘是多工具长任务：8~15 步、每步重发历史，60k 会中途截断。
-		// 200k 足够一次完整分析，同时仍是硬上限（超出即优雅收尾并如实报告）。
-		MaxTokensPerRun: 200000,
+		PathRoots:    []string{cfg.DataDir},
+		AllowExec:    false,
+		MaxReqPerMin: 120,
+		MaxToolCalls: 30,
+		// Token 不设预算上限：0 = 不限制（用户要求）。
+		// 停机只由「单次运行工具调用上限」和模型自身的输出上限决定；
+		// 如果确实需要成本闸门，在设置中心的内核策略里显式写一个 >0 的值即可。
+		MaxTokensPerRun: 0,
+		// 主控 Agent 可以调节观澜自身（调度/模型/盯盘/插件/知识库），见 app.method。
+		AllowMethodControl: true,
 	}
 }
 
@@ -110,8 +118,14 @@ func stubNewGuard(cfg Config, store contract.Store, _ *slog.Logger) contract.Gua
 	policy := defaultPolicy(cfg)
 	if raw, err := store.Get(bucketSettings, "policy"); err == nil && len(raw) > 0 {
 		var p contract.Policy
-		if json.Unmarshal(raw, &p) == nil && len(p.NetworkAllowlist) > 0 {
-			policy = p
+		if json.Unmarshal(raw, &p) == nil {
+			if hosts := stripRetiredHosts(p.NetworkAllowlist); len(hosts) > 0 {
+				p.NetworkAllowlist = hosts
+				if !jsonHasKey(raw, "allowMethodControl") {
+					p.AllowMethodControl = policy.AllowMethodControl
+				}
+				policy = p
+			}
 		}
 	}
 	roots := policy.PathRoots

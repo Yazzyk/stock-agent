@@ -143,8 +143,26 @@ func TestPluginRegistersUIAndMethods(t *testing.T) {
 			if !p.Active {
 				t.Fatalf("插件未激活: %s", p.Error)
 			}
-			if len(p.Methods) != 4 {
-				t.Fatalf("应有 4 个方法, got %d", len(p.Methods))
+			if len(p.Methods) != 12 {
+				t.Fatalf("应有 12 个方法（list/save/remove/test/setDefault/presets + WorkBuddy 6 个）, got %d", len(p.Methods))
+			}
+			wantMethods := map[string]bool{
+				"setDefault":      false,
+				"workbuddyStatus": false, "workbuddyModels": false, "workbuddyLogin": false,
+				"workbuddyLoginPoll": false, "workbuddyImport": false, "workbuddyLogout": false,
+			}
+			for _, m := range p.Methods {
+				if _, ok := wantMethods[m.Name]; ok {
+					wantMethods[m.Name] = true
+				}
+				if m.Description == "" {
+					t.Fatalf("方法 %s 缺少中文描述", m.Name)
+				}
+			}
+			for name, seen := range wantMethods {
+				if !seen {
+					t.Fatalf("缺少方法 %s", name)
+				}
 			}
 			if len(p.UI) == 1 {
 				slot = &p.UI[0]
@@ -190,6 +208,55 @@ func TestListNeverReturnsPlaintextKey(t *testing.T) {
 	}
 }
 
+// presets 是「新增配置」下拉的数据源：无网络、只读，DeepSeek 官方数值必须与契约一致。
+func TestPresetsReturnsOfficialDefaults(t *testing.T) {
+	k, _ := newKernelWithLLM(t)
+	m := invoke(t, k, "presets", map[string]any{})
+	providers, ok := m["providers"].([]any)
+	if !ok || len(providers) == 0 {
+		t.Fatalf("presets 形状不符: %v", m)
+	}
+	var deepseek map[string]any
+	for _, raw := range providers {
+		p, _ := raw.(map[string]any)
+		if p["provider"] == "deepseek" {
+			deepseek = p
+		}
+	}
+	if deepseek == nil {
+		t.Fatalf("缺少 deepseek 预设: %v", providers)
+	}
+	if deepseek["baseUrl"] != "https://api.deepseek.com" {
+		t.Fatalf("baseUrl 不符: %v", deepseek["baseUrl"])
+	}
+	if deepseek["keyUrl"] == nil || deepseek["docsUrl"] == nil {
+		t.Fatalf("缺少 Key/Docs 链接: %v", deepseek)
+	}
+	models, _ := deepseek["models"].([]any)
+	if len(models) == 0 {
+		t.Fatalf("deepseek 应有模型预设: %v", deepseek)
+	}
+	var flash map[string]any
+	for _, raw := range models {
+		mp, _ := raw.(map[string]any)
+		if mp["model"] == "deepseek-flash" {
+			flash = mp
+		}
+	}
+	if flash == nil {
+		t.Fatalf("缺少 deepseek-flash 预设: %v", models)
+	}
+	if flash["contextWindow"].(float64) != 1048576 {
+		t.Fatalf("contextWindow 应为 1M: %v", flash["contextWindow"])
+	}
+	if flash["maxOutput"].(float64) != 393216 {
+		t.Fatalf("maxOutput 应为 384K: %v", flash["maxOutput"])
+	}
+	if flash["defaultMaxTokens"].(float64) != 8192 {
+		t.Fatalf("defaultMaxTokens 应为 8192: %v", flash["defaultMaxTokens"])
+	}
+}
+
 func TestSaveRequiresProviderAndRemoveUnknownFails(t *testing.T) {
 	k, _ := newKernelWithLLM(t)
 	raw, _ := json.Marshal(map[string]any{"model": "x"})
@@ -213,5 +280,37 @@ func TestTestMethodReturnsFailureShape(t *testing.T) {
 	}
 	if m["ok"] == true {
 		t.Fatal("没有 key 时不应测试成功")
+	}
+}
+
+// workbuddyStatus 只读本地凭证库：未登录时也要返回可操作提示，且绝不回传 token。
+func TestWorkBuddyStatusShape(t *testing.T) {
+	k, _ := newKernelWithLLM(t)
+	m := invoke(t, k, "workbuddyStatus", map[string]any{})
+	loggedIn, ok := m["loggedIn"].(bool)
+	if !ok {
+		t.Fatalf("workbuddyStatus 缺少 loggedIn: %v", m)
+	}
+	if !loggedIn && m["message"] == "" {
+		t.Fatalf("未登录时应给出可操作提示: %v", m)
+	}
+	if m["vaultPath"] == nil || m["vaultPath"] == "" {
+		t.Fatalf("应返回凭证库路径便于排查: %v", m)
+	}
+	for _, leaked := range []string{"accessToken", "refreshToken", "token"} {
+		if _, exists := m[leaked]; exists {
+			t.Fatalf("状态里不能出现 %s: %v", leaked, m)
+		}
+	}
+}
+
+// workbuddyLogout 在没有本地凭证时也应成功（幂等），并返回中文提示。
+func TestWorkBuddyLogoutIdempotent(t *testing.T) {
+	k, _ := newKernelWithLLM(t)
+	for i := 0; i < 2; i++ {
+		m := invoke(t, k, "workbuddyLogout", map[string]any{})
+		if msg, _ := m["message"].(string); msg == "" {
+			t.Fatalf("第 %d 次退出缺少提示: %v", i+1, m)
+		}
 	}
 }

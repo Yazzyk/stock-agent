@@ -75,6 +75,21 @@ type Trade struct {
 	Days       int     `json:"days"`
 }
 
+// Fill 是一笔实际成交（开仓/加仓/减仓/清仓各算一笔），供前端在 K 线上画买卖标记。
+// 与 Trade（建仓到清仓的往返）互补而不是替代：Trade 回答「这笔赚了多少」，
+// Fill 回答「哪天、什么价位、买卖了多少」。
+type Fill struct {
+	Date   string  `json:"date"`
+	Side   string  `json:"side"` // buy | sell
+	Price  float64 `json:"price"`
+	Qty    int     `json:"qty"`
+	Reason string  `json:"reason,omitempty"`
+}
+
+// maxFills 是成交明细的条数上限（契约 §3.7.1）：超出截断并留一条提示，
+// 否则十年日线的动量策略能产出几万条，前端 canvas 画不动、JSON 也传不完。
+const maxFills = 500
+
 // EquityPoint 是每日净值。
 type EquityPoint struct {
 	Date     string  `json:"date"`
@@ -99,24 +114,26 @@ func (c CostBreakdown) Total() float64 {
 
 // Result 是一次回测的完整结果。
 type Result struct {
-	Strategy     string        `json:"strategy"`
-	Code         string        `json:"code"`
-	Start        string        `json:"start"`
-	End          string        `json:"end"`
-	Bars         int           `json:"bars"`
-	InitialCash  float64       `json:"initialCash"`
-	FinalEquity  float64       `json:"finalEquity"`
-	TotalReturn  float64       `json:"totalReturn"`
-	CAGR         float64       `json:"cagr"`
-	MaxDrawdown  float64       `json:"maxDrawdown"`
-	Sharpe       float64       `json:"sharpe"`
-	Sortino      float64       `json:"sortino"`
-	WinRate      float64       `json:"winRate"`
-	Turnover     float64       `json:"turnover"`
-	TradeCount   int           `json:"tradeCount"`
-	Trades       []Trade       `json:"trades"`
-	Equity       []EquityPoint `json:"equity"`
-	Costs        CostBreakdown `json:"costs"`
+	Strategy    string  `json:"strategy"`
+	Code        string  `json:"code"`
+	Start       string  `json:"start"`
+	End         string  `json:"end"`
+	Bars        int     `json:"bars"`
+	InitialCash float64 `json:"initialCash"`
+	FinalEquity float64 `json:"finalEquity"`
+	TotalReturn float64 `json:"totalReturn"`
+	CAGR        float64 `json:"cagr"`
+	MaxDrawdown float64 `json:"maxDrawdown"`
+	Sharpe      float64 `json:"sharpe"`
+	Sortino     float64 `json:"sortino"`
+	WinRate     float64 `json:"winRate"`
+	Turnover    float64 `json:"turnover"`
+	TradeCount  int     `json:"tradeCount"`
+	Trades      []Trade `json:"trades"`
+	// Fills 是逐笔成交（买卖各一条，≤500 条），供前端画买卖点；Trades 语义不变。
+	Fills  []Fill        `json:"fills,omitempty"`
+	Equity []EquityPoint `json:"equity"`
+	Costs  CostBreakdown `json:"costs"`
 	// Warnings 记录降级事实（例如数据不足、涨跌停导致错过信号）。
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -194,6 +211,11 @@ func Run(code string, bars []contract.Bar, strat Strategy, opt Options) Result {
 				slippage := (price - next.Open) * float64(buy)
 				cost := commission + transfer
 				if amount+cost <= cash {
+					reason := "开仓"
+					if shares > 0 {
+						reason = "加仓"
+					}
+					res.appendFill(Fill{Date: next.Date, Side: "buy", Price: round2(price), Qty: buy, Reason: reason})
 					cash -= amount + cost
 					shares = wantShares
 					res.Costs.Commission += commission
@@ -220,6 +242,11 @@ func Run(code string, bars []contract.Bar, strat Strategy, opt Options) Result {
 				stamp := amount * opt.Cost.StampTaxRate
 				transfer := amount * opt.Cost.TransferRate
 				slippage := (next.Open - price) * float64(sell)
+				reason := "减仓"
+				if wantShares == 0 {
+					reason = "清仓"
+				}
+				res.appendFill(Fill{Date: next.Date, Side: "sell", Price: round2(price), Qty: sell, Reason: reason})
 				cash += amount - commission - stamp - transfer
 				shares = wantShares
 				res.Costs.Commission += commission
@@ -252,6 +279,15 @@ func Run(code string, bars []contract.Bar, strat Strategy, opt Options) Result {
 	}
 	res.computeMetrics()
 	return res
+}
+
+// appendFill 记录一笔成交；超过上限只提示一次，不静默丢数据。
+func (r *Result) appendFill(fill Fill) {
+	if len(r.Fills) >= maxFills {
+		r.Warnings = appendUnique(r.Warnings, fmt.Sprintf("成交明细超过 %d 笔，已截断（只保留前 %d 笔）", maxFills, maxFills))
+		return
+	}
+	r.Fills = append(r.Fills, fill)
 }
 
 func (r *Result) appendEquity(bar contract.Bar, cash float64, shares int, price float64) {

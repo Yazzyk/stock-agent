@@ -150,3 +150,104 @@ func TestComputeIndicatorsVolume(t *testing.T) {
 		t.Fatalf("MA5 长度 = %d，期望 2", len(ind.MA5))
 	}
 }
+
+// validBias 判断三态结论是否合法：前端只认这三个字面量。
+func validBias(b string) bool {
+	return b == biasBull || b == biasBear || b == biasNeutral
+}
+
+// TestAnalyzeHorizonsBothScales 覆盖短线/长线双尺度：窗口、三态结论、摘要完整性与结构位。
+func TestAnalyzeHorizonsBothScales(t *testing.T) {
+	bars := waveBars(200)
+	got := AnalyzeHorizons(bars)
+	if len(got) != 2 {
+		t.Fatalf("应返回短线/长线两份研判，实际 %d 份", len(got))
+	}
+	short, long := got[0], got[1]
+	if short.Key != horizonShort || short.Window != shortHorizonWindow {
+		t.Fatalf("短线 = key %q / window %d", short.Key, short.Window)
+	}
+	if long.Key != horizonLong || long.Window != len(bars) {
+		t.Fatalf("长线 = key %q / window %d", long.Key, long.Window)
+	}
+	for _, h := range got {
+		if h.Title == "" {
+			t.Fatalf("%s 缺少标题", h.Key)
+		}
+		if !validBias(h.Bias) {
+			t.Fatalf("%s 的 bias = %q，应为偏多/偏空/中性", h.Key, h.Bias)
+		}
+		for label, text := range map[string]string{
+			"趋势": h.Summary.Trend, "均线": h.Summary.MA, "RSI": h.Summary.RSI,
+			"MACD": h.Summary.MACD, "ATR": h.Summary.ATR,
+		} {
+			if strings.TrimSpace(text) == "" {
+				t.Fatalf("%s 的 %s 摘要为空", h.Key, label)
+			}
+			for _, banned := range []string{"买入", "卖出", "建仓", "清仓", "目标价"} {
+				if strings.Contains(text, banned) {
+					t.Fatalf("%s 的 %s 摘要出现交易指令 %q: %q", h.Key, label, banned, text)
+				}
+			}
+		}
+		if len(h.Support) == 0 || len(h.Resistance) == 0 {
+			t.Fatalf("%s 的支撑/阻力不能为空: %v / %v", h.Key, h.Support, h.Resistance)
+		}
+	}
+}
+
+// TestAnalyzeHorizonWindows 覆盖窗口截取、样本不足提示、空输入与未知尺度回落。
+func TestAnalyzeHorizonWindows(t *testing.T) {
+	long := AnalyzeHorizon(waveBars(300), horizonLong)
+	if long.Window != longHorizonWindow {
+		t.Fatalf("长线窗口 = %d，上限应为 %d", long.Window, longHorizonWindow)
+	}
+	if strings.Contains(long.Summary.Trend, "不足 120 根") {
+		t.Fatalf("300 根长线不应提示样本不足: %q", long.Summary.Trend)
+	}
+
+	shortSample := AnalyzeHorizon(waveBars(80), horizonLong)
+	if shortSample.Window != 80 {
+		t.Fatalf("长线窗口 = %d，应为全部 80 根", shortSample.Window)
+	}
+	if !strings.Contains(shortSample.Summary.Trend, "不足 120 根") {
+		t.Fatalf("80 根长线应明确提示样本不足，实际 %q", shortSample.Summary.Trend)
+	}
+	if !strings.Contains(shortSample.Summary.MA, "MA120") {
+		t.Fatalf("80 根长线均线摘要应说明 MA120 缺失，实际 %q", shortSample.Summary.MA)
+	}
+
+	tiny := AnalyzeHorizon(waveBars(10), horizonShort)
+	if tiny.Window != 10 || !validBias(tiny.Bias) {
+		t.Fatalf("10 根短线 = window %d / bias %q", tiny.Window, tiny.Bias)
+	}
+	if !strings.Contains(tiny.Summary.Trend, "不足 20 根") {
+		t.Fatalf("10 根短线应提示样本不足，实际 %q", tiny.Summary.Trend)
+	}
+
+	empty := AnalyzeHorizon(nil, horizonShort)
+	if empty.Window != 0 || empty.Bias != biasNeutral {
+		t.Fatalf("空输入应返回中性零值，实际 %+v", empty)
+	}
+
+	if unknown := AnalyzeHorizon(waveBars(30), "week"); unknown.Key != horizonShort {
+		t.Fatalf("未知尺度应回落短线，实际 %q", unknown.Key)
+	}
+}
+
+// TestAnalyzeHorizonBiasDirection 用单调上涨序列钉住双尺度都给出偏多（红涨口径的结构描述）。
+func TestAnalyzeHorizonBiasDirection(t *testing.T) {
+	bars := make([]contract.Bar, 200)
+	price := 10.0
+	for i := range bars {
+		open := price
+		closePrice := price + 0.1
+		bars[i] = contract.Bar{Open: open, High: closePrice + 0.05, Low: open - 0.05, Close: closePrice, Volume: float64(1000 + i*10)}
+		price = closePrice
+	}
+	for _, horizon := range []string{horizonShort, horizonLong} {
+		if got := AnalyzeHorizon(bars, horizon); got.Bias != biasBull {
+			t.Fatalf("%s 上涨序列的 bias = %q，期望偏多", horizon, got.Bias)
+		}
+	}
+}

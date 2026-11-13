@@ -1,0 +1,13 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-limit-up",
+  "data": {
+    "timestamp": 1794552923627,
+    "pagination": {"total": 38, "pages": 1, "size": 50, "page": 1},
+    "item": [
+      {"thscode":"605318.SH","ticker":"605318","name":"超颖电子","is_st":false,"is_new":false,"last_price":99.54,"price_change_ratio_pct":10.0,"limit_up_time":"09:38","open_times":1,"limit_up_reason":"AI算力PCB","continue_day_text":"3连板","continue_day_cnt":3,"seal_money":11088756.0,"max_seal_money":22177512.0},
+      {"thscode":"605255.SH","ticker":"605255","name":"天普股份","is_st":false,"is_new":true,"last_price":67.11,"price_change_ratio_pct":9.99,"limit_up_time":"09:41","open_times":null,"limit_up_reason":"实控人变更","continue_day_text":"首板","continue_day_cnt":1,"seal_money":7194192.0,"max_seal_money":7194192.0}
+    ]
+  }
+}

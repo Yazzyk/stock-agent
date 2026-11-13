@@ -84,15 +84,15 @@ func (r RiskLevel) AtMost(limit RiskLevel) bool {
 // Tool 是一个可被 LLM 调用的能力。字段分别服务渐进式披露的三级：
 // Name/Title/Summary/Tags = L1；Schema/Examples = L2；Run = L3。
 type Tool struct {
-	Name     string                                                    `json:"name"`
-	Title    string                                                    `json:"title"`
-	Summary  string                                                    `json:"summary"`
-	Tags     []string                                                  `json:"tags,omitempty"`
-	Schema   json.RawMessage                                           `json:"schema,omitempty"`
-	Examples []string                                                  `json:"examples,omitempty"`
-	Risk     RiskLevel                                                 `json:"risk"`
+	Name     string                                                       `json:"name"`
+	Title    string                                                       `json:"title"`
+	Summary  string                                                       `json:"summary"`
+	Tags     []string                                                     `json:"tags,omitempty"`
+	Schema   json.RawMessage                                              `json:"schema,omitempty"`
+	Examples []string                                                     `json:"examples,omitempty"`
+	Risk     RiskLevel                                                    `json:"risk"`
 	Run      func(ctx context.Context, args json.RawMessage) (any, error) `json:"-"`
-	Owner    string                                                    `json:"owner,omitempty"`
+	Owner    string                                                       `json:"owner,omitempty"`
 }
 
 // Validate 在注册时兜底，避免半成品工具进索引。

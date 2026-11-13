@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cloudwego/eino/schema"
+
 	"github.com/yazzyk/stock-agent/pkg/contract"
 )
 
@@ -310,8 +312,8 @@ func TestChatAgainstFakeOpenAI(t *testing.T) {
 	}
 	temp := 0.2
 	reply, err := svc.Chat(context.Background(), contract.ChatRequest{
-		System:   "你是研究员",
-		Messages: []contract.Message{{Role: contract.RoleUser, Content: "hi"}},
+		System:      "你是研究员",
+		Messages:    []contract.Message{{Role: contract.RoleUser, Content: "hi"}},
 		Temperature: &temp,
 		MaxTokens:   64,
 	})
@@ -530,5 +532,163 @@ func TestToolMessageRequiresToolCallID(t *testing.T) {
 	_, err := toEinoMessages(contract.ChatRequest{Messages: []contract.Message{{Role: contract.RoleTool, Content: "x"}}}, nil)
 	if err == nil || !errors.Is(err, err) || !strings.Contains(err.Error(), "toolCallId") {
 		t.Fatalf("缺少 toolCallId 应报错: %v", err)
+	}
+}
+
+// Agent 的模型下拉用 provider/model 形式；pick 必须能精确匹配到该条配置。
+func TestPickByProviderSlashModel(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	views, _, err := svc.List()
+	if err != nil {
+		t.Fatalf("List 失败: %v", err)
+	}
+	if len(views) == 0 {
+		t.Fatal("没有可用配置")
+	}
+	view := views[0]
+	key := view.Provider + "/" + view.Model
+	picked, err := svc.pick(key)
+	if err != nil {
+		t.Fatalf("pick(%q) 失败: %v", key, err)
+	}
+	if picked.ID != view.ID {
+		t.Fatalf("pick(%q) 命中了错误配置: got %s want %s", key, picked.ID, view.ID)
+	}
+}
+
+// TestSetDefault 验证默认模型可以在已保存的配置之间切换，且不改动配置本身。
+func TestSetDefault(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	first := seedID(t, svc)
+
+	views, _, err := svc.Save(SaveInput{
+		Provider: "openai",
+		Model:    "gpt-test",
+		BaseURL:  "http://127.0.0.1:1/v1",
+		APIKey:   "sk-test",
+	})
+	if err != nil {
+		t.Fatalf("新增第二条配置失败: %v", err)
+	}
+	second := ""
+	for _, v := range views {
+		if v.ID != first {
+			second = v.ID
+		}
+	}
+	if second == "" {
+		t.Fatal("没有找到第二条模型配置")
+	}
+
+	views, defaultID, err := svc.SetDefault(second)
+	if err != nil {
+		t.Fatalf("SetDefault 失败: %v", err)
+	}
+	if defaultID != second {
+		t.Fatalf("默认 ID 应为 %q，实际 %q", second, defaultID)
+	}
+	for _, v := range views {
+		if v.IsDefault != (v.ID == second) {
+			t.Fatalf("模型 %q 的 isDefault=%v，与默认 ID 不一致", v.ID, v.IsDefault)
+		}
+	}
+
+	if _, _, err := svc.SetDefault("missing"); err == nil {
+		t.Fatal("不存在的 id 应报错")
+	}
+	if _, _, err := svc.SetDefault("  "); err == nil {
+		t.Fatal("空 id 应报错")
+	}
+}
+
+// ---------- 缓存命中（提供方上报） ----------
+
+// TestUsageOfCachedTokens 验证 usageOf 能取到 eino 的 PromptTokenDetails.CachedTokens。
+func TestUsageOfCachedTokens(t *testing.T) {
+	msg := &schema.Message{ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{
+		PromptTokens:       1200,
+		PromptTokenDetails: schema.PromptTokenDetails{CachedTokens: 900},
+		CompletionTokens:   80,
+		TotalTokens:        1280,
+	}}}
+	u := usageOf(msg)
+	if u.PromptTokens != 1200 || u.CompletionTokens != 80 || u.TotalTokens != 1280 {
+		t.Fatalf("基础用量解析不符: %+v", u)
+	}
+	if u.CachedTokens != 900 {
+		t.Fatalf("必须取到提示词缓存命中数，实际 %d", u.CachedTokens)
+	}
+	if empty := usageOf(nil); empty.CachedTokens != 0 {
+		t.Fatalf("空消息不应编造缓存命中: %+v", empty)
+	}
+}
+
+// TestStreamUsageKeepsCachedTokensFromChunks 钉住流式对账：
+// eino 的 ConcatMessages 只逐字段取最大，若合并后的消息丢了 PromptTokenDetails，
+// 必须用逐 chunk 累计到的缓存命中数兜底，不能静默变成 0。
+func TestStreamUsageKeepsCachedTokensFromChunks(t *testing.T) {
+	acc := contract.Usage{PromptTokens: 1000, CompletionTokens: 50, TotalTokens: 1050, CachedTokens: 640}
+	merged := &schema.Message{ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{
+		PromptTokens:     1000,
+		CompletionTokens: 50,
+		TotalTokens:      1050,
+	}}}
+	u := streamUsage(merged, acc)
+	if u.CachedTokens != 640 {
+		t.Fatalf("合并后丢失细节时应回落到逐 chunk 累计值，实际 %d", u.CachedTokens)
+	}
+	if u.PromptTokens != 1000 || u.TotalTokens != 1050 {
+		t.Fatalf("其余字段应以合并后的消息为准: %+v", u)
+	}
+
+	// 合并后自带细节时以它为准（它是完整的一条消息）。
+	mergedWithDetails := &schema.Message{ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{
+		PromptTokens:       1000,
+		PromptTokenDetails: schema.PromptTokenDetails{CachedTokens: 512},
+		CompletionTokens:   50,
+		TotalTokens:        1050,
+	}}}
+	if u := streamUsage(mergedWithDetails, acc); u.CachedTokens != 512 {
+		t.Fatalf("合并后已有明细时应以它为准，实际 %d", u.CachedTokens)
+	}
+
+	// 合并后完全没有用量时整体回落到逐 chunk 累计值。
+	if u := streamUsage(&schema.Message{}, acc); u.CachedTokens != 640 || u.TotalTokens != 1050 {
+		t.Fatalf("没有合并用量时应回落到累计值: %+v", u)
+	}
+}
+
+// TestStreamParsesCachedTokensFromProvider 验证真实流式路径（OpenAI 兼容 SSE）能拿到缓存命中数。
+func TestStreamParsesCachedTokensFromProvider(t *testing.T) {
+	srv := fakeChatServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		chunk := map[string]any{
+			"id": "x", "object": "chat.completion.chunk", "created": 1, "model": "gpt-test",
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": "pong"}, "finish_reason": "stop"}},
+			"usage": map[string]any{
+				"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+				"prompt_tokens_details": map[string]any{"cached_tokens": 64},
+			},
+		}
+		b, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
+	svc, _, _ := newTestService(t)
+	if _, _, err := svc.Save(SaveInput{Provider: "openai", Model: "gpt-test", BaseURL: srv.URL + "/v1", APIKey: "sk-test", SetDefault: true}); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := svc.Stream(context.Background(), contract.ChatRequest{
+		Messages: []contract.Message{{Role: contract.RoleUser, Content: "hi"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Stream 失败: %v", err)
+	}
+	if reply.Usage.PromptTokens != 100 || reply.Usage.CachedTokens != 64 {
+		t.Fatalf("流式路径必须带出提供方上报的缓存命中数: %+v", reply.Usage)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,9 +17,9 @@ import (
 )
 
 // 来源名用于 Health 归因与日志，禁止随意新增（Health 输出会直接展示给用户）。
+// 注意：东财来源已整体下线 —— 数据层只走同花顺/腾讯/新浪。
 const (
 	sourceTHS       = "ths"
-	sourceEastMoney = "eastmoney"
 	sourceSina      = "sina"
 	sourceTencent   = "tencent"
 	sourceStore     = "store"
@@ -38,7 +39,7 @@ const (
 var (
 	// ErrGuardDenied 表示目标主机不在网络安全白名单内。
 	ErrGuardDenied = errors.New("datasource: 目标主机不在网络安全白名单内")
-	// ErrEmptyResponse 表示服务端返回空响应体（东财 kline 端点会直接断连，必须当作可重试失败）。
+	// ErrEmptyResponse 表示服务端返回空响应体（上游偶发断连会留下空 body，必须当作可重试失败）。
 	ErrEmptyResponse = errors.New("datasource: 响应体为空")
 )
 
@@ -84,7 +85,7 @@ func newClient(cfg Config, now func() time.Time) *client {
 	}
 	return &client{
 		guard:   cfg.Guard,
-		http:    &http.Client{Timeout: timeout},
+		http:    newDirectHTTPClient(timeout),
 		limiter: newTokenBucket(defaultQPS, now),
 		log:     logger,
 		retries: defaultRetries,
@@ -92,6 +93,35 @@ func newClient(cfg Config, now func() time.Time) *client {
 		sources: map[string]*sourceState{},
 		now:     now,
 	}
+}
+
+// newDirectHTTPClient 构造国内行情源专用客户端。
+//
+// 与 go-stock 的共享客户端保持一致：
+//   - 直连：境内行情源（同花顺/腾讯/新浪）不走 HTTP_PROXY。系统代理常把行情请求
+//     转到海外节点，服务端会直接掐断连接，表现为 `EOF` 或空响应。
+//   - IPv4 优先：部分网络下 IPv6 到行情 CDN 的连接会被 RST；先拨 tcp4，失败再回退系统解析。
+//
+// 不主动禁用 HTTP/2：腾讯/新浪的 CDN 在 ALPN 协商 h2 后如果客户端按 h1 解析会直接失败；
+// 行情源的 EOF 发生在 TLS 之后，与协议版本无关（HTTP/1.1 实测同样 EOF）。
+func newDirectHTTPClient(timeout time.Duration) *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: timeout}
+	}
+	transport := base.Clone()
+	transport.Proxy = nil
+	transport.MaxIdleConnsPerHost = 8
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network == "tcp" {
+			if conn, err := dialer.DialContext(ctx, "tcp4", addr); err == nil {
+				return conn, nil
+			}
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
 // get 执行一次带安全校验、限速、重试的 GET，返回原始字节（gbk 请求已在内部转成 UTF-8）。
@@ -172,7 +202,7 @@ func (c *client) do(ctx context.Context, req request, parsed *url.URL) ([]byte, 
 		return nil, true, fmt.Errorf("datasource: 读取 %s 响应失败: %w", parsed.Host, err)
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		// 东财 push2 的 kline 端点会直接断连并留下空响应，这里必须可重试而不是把空当成功。
+		// 上游偶发断连会留下空响应，必须当作可重试失败而不是把空当成功。
 		return nil, true, fmt.Errorf("%w: %s", ErrEmptyResponse, parsed.Host)
 	}
 	if req.gbk {
@@ -207,7 +237,7 @@ func (c *client) record(source string, err error) {
 
 // knownSources 是需要出现在 Health 里的固定数据源清单。
 // 固定列出的好处是面板永远能展示「哪些源没被用过」，而不是根据调用记录动态变形。
-var knownSources = []string{sourceTHS, sourceEastMoney, sourceSina, sourceTencent}
+var knownSources = []string{sourceFuyao, sourceTHS, sourceSina, sourceTencent}
 
 // health 把各数据源的最近一次结果整理成可读文案（不发新请求）。
 func (c *client) health() map[string]string {

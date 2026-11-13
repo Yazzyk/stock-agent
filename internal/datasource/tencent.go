@@ -1,6 +1,7 @@
 package datasource
 
 import (
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -133,6 +134,18 @@ func txStamp(raw string) string {
 // txQuoteURL 拼接批量快照地址。
 func txQuoteURL(symbols []string) string {
 	return "https://qt.gtimg.cn/q=" + strings.Join(symbols, ",")
+}
+
+// txSuggestURL 是腾讯 smartbox 搜索建议地址：v_hint="sh~600000~浦发银行~pfyh~GP-A"。
+func txSuggestURL(keyword string) string {
+	return "https://smartbox.gtimg.cn/s3/?q=" + url.QueryEscape(keyword) + "&t=all"
+}
+
+// StockSuggestion 是搜索建议的统一中间结构（腾讯 smartbox 解析后归一到这里）。
+type StockSuggestion struct {
+	Code   string
+	Name   string
+	Market contract.Market
 }
 
 // parseTxSuggest 解析腾讯 smartbox 搜索建议：v_hint="sh~600000~浦发银行~pfyh~GP-A^sz~000001~..."。

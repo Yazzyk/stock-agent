@@ -2,7 +2,12 @@
 //
 // 设计取向是「诚实优先」：
 //   - 成交量一律以「手」对外，各源原始单位（股/手）在解析处换算，绝不靠调用方猜；
-//   - 复权只有东财 fqt 能提供真序列，同花顺 v6 line 是不复权，请求 qfq/hfq 时宁可报错也不冒充；
+//   - 上游只有同花顺 / 腾讯 / 新浪三家，**没有任何东财接口**；
+//   - 复权：前复权与后复权都走腾讯 fqkline（qfqday / hfqday 两套键），
+//     绝不用前复权冒充后复权。实测同花顺 v6 line 返回的本身就是前复权序列
+//     （证据见 tencent_kline.go 顶部），不要再按「同花顺是不复权」这个错误前提写降级；
+//   - 资金流只有新浪一口径：个股当日 rN_in-rN_out，多日/板块用 ssl_* 系列，
+//     其中板块榜是「全部资金净额」而不是「主力净额」（见 sina_flow.go 顶部）；
 //   - 部分失败返回成功的部分 + 可判定的 ErrPartial，不把整批结果吞掉。
 //
 // 上游端点与实测结论见 docs/PLAN.md §4 与本包 testdata/ 下的真实响应样本。
@@ -16,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yazzyk/stock-agent/pkg/contract"
@@ -23,7 +29,7 @@ import (
 
 // 可以判定（errors.Is）的业务错误。插件与工具据此给出可操作提示。
 var (
-	// ErrAdjustUnsupported 表示目标数据源给不出可信的复权序列（目前只有东财 fqt 可以）。
+	// ErrAdjustUnsupported 表示目标数据源给不出可信的复权序列（qfq/hfq 都只有腾讯 fqkline 一条链路）。
 	ErrAdjustUnsupported = errors.New("datasource: 当前行情源不提供复权序列")
 	// ErrPeriodUnsupported 表示该周期没有可靠数据源。
 	ErrPeriodUnsupported = errors.New("datasource: 当前行情源不支持该周期")
@@ -60,7 +66,7 @@ var thsPeriodCodes = map[contract.Period]string{
 	contract.PeriodMin30: "41",
 }
 
-// 东财周期代码（klt）。
+// （腾讯 fqkline 只有日/周/月，其余周期走同花顺或直接报 ErrPeriodUnsupported。）
 var emPeriodCodes = map[contract.Period]int{
 	contract.PeriodDay:   101,
 	contract.PeriodWeek:  102,
@@ -91,6 +97,14 @@ type Service struct {
 	dir    string
 	// home 用于定位同花顺容器；生产取用户主目录，测试可注入临时目录。
 	home string
+	// webLoginInvalid 记住「上一次在线请求被服务端判定登录态失效」的事实（不落盘）。
+	// 没有它，过期 cookie 会让诊断一直报 ok，前端就会反复自动同步、反复失败。
+	webLoginInvalid string
+	webLoginMu      sync.Mutex
+	// fy 是官方金融数据 API 的配置缓存（Key 来源、baseUrl、开关）。
+	fy fuyaoState
+	// q 是官方快照的进程内辅助状态（名称缓存、落盘节流）。
+	q quoteState
 }
 
 var _ contract.DataService = (*Service)(nil)
@@ -112,6 +126,7 @@ func New(cfg Config) (contract.DataService, error) {
 		client: newClient(cfg, now),
 		cache:  newCache(now),
 		now:    now,
+		q:      newQuoteState(),
 		dir:    strings.TrimSpace(cfg.DataDir),
 		home:   home,
 	}
@@ -147,10 +162,29 @@ func (s *Service) Quote(ctx context.Context, codes []string) ([]contract.Quote, 
 		return nil, fmt.Errorf("%w: 全部代码无法识别（%s）", ErrNoData, strings.Join(failures, ", "))
 	}
 
-	fallback := s.batchFallbackQuotes(ctx, parsed)
-	useTHSPerCode := len(parsed) <= thsPerCodeLimit
+	// 官方 API 优先（一次批量取齐），失败静默降级到腾讯/新浪 + 网页同花顺。
+	// 关键优化（任务 1）：官方命中时不再无条件再打一次腾讯批量；只有官方缺失的
+	// 代码、或真的缺名称时才走兜底源，避免每次刷新固定两个 RTT。
+	official, missing := s.fuyaoSnapshotWithFallback(ctx, parsed)
+	var fallback map[string]contract.Quote
+	if len(missing) > 0 {
+		fallback = s.batchFallbackQuotes(ctx, missing)
+	}
+	// 只有走官方降级路径的代码才逐只抓同花顺；官方已命中的不重复抓。
+	useTHSPerCode := len(missing) <= thsPerCodeLimit
 	out := make([]contract.Quote, 0, len(parsed))
 	for _, code := range parsed {
+		if quote, ok := official[code.ID()]; ok {
+			// 官方快照不带名称：fuyaoSnapshotWithFallback 已用本地缓存/一次批量补齐；
+			// 仍为空时保留空名字（不阻断价格展示），下次列表会再补。
+			quote = normalizeQuoteState(quote)
+			s.cache.put("quote:"+code.ID(), quote, ttlQuote)
+			if s.shouldPersistQuote(code, quote) {
+				s.saveCachedQuote(code, quote)
+			}
+			out = append(out, quote)
+			continue
+		}
 		quote, err := s.quoteOne(ctx, code, fallback[code.ID()], useTHSPerCode)
 		if err != nil {
 			s.log.Warn("快照取数失败", "code", code.Raw, "error", err)
@@ -299,7 +333,10 @@ func (s *Service) quoteOne(ctx context.Context, code Code, fallback contract.Quo
 	}
 	quote = normalizeQuoteState(quote)
 	s.cache.put(cacheKey, quote, ttlQuote)
-	s.saveCachedQuote(code, quote)
+	// 落盘节流：自选面板 5 秒轮询时不再每轮写 50 次 sqlite。
+	if s.shouldPersistQuote(code, quote) {
+		s.saveCachedQuote(code, quote)
+	}
 	return quote, nil
 }
 
@@ -472,8 +509,16 @@ func (s *Service) saveCachedName(code Code, name string) {
 
 // Bars 返回指定周期 K 线，按时间升序，体积单位手。
 //
-// 复权说明：只有东财 fqt 能给真复权序列；同花顺 v6 line 是不复权。
-// 因此 adj=qfq/hfq 时若东财不可用，返回 ErrAdjustUnsupported 而不是拿不复权数据冒充。
+// 复权口径（2026-11-12 真实网络复核，腾讯 fqkline 的 qfq 与 hfq 两套键都可用）：
+//   - qfq：腾讯 fqkline qfq 单源；失败即返回 ErrAdjustUnsupported（由 plugins/kline 降级为不复权）。
+//   - hfq：腾讯 fqkline hfq 单源（键 hfqday/hfqweek/hfqmonth）。
+//     实测 param=sh600000,day,,,30,hfq 返回 data.sh600000.hfqday，价格高于原始序列（后复权口径），
+//     所以「后复权只有东财能给」这个前提已经不成立，不需要也不允许拿前复权冒充。
+//   - none：腾讯原始序列 → 新浪日线 → 同花顺兜底。
+//     老顺序是「同花顺优先」，但实测 THS v6 line 返回的**就是前复权序列**（除权日之前的价格
+//     已下调，与腾讯 qfq 一致，与腾讯原始价差约 28 元/股），拿它当不复权会让研判/回测
+//     建立在已调整过的价格上。THS 现在只作最后兜底（覆盖指数/周/月且最稳），
+//     走到它时口径已降级，上层需要按 warning 如实说明。
 func (s *Service) Bars(ctx context.Context, code string, p contract.Period, limit int, adj contract.Adjust) ([]contract.Bar, error) {
 	parsed, err := ParseCode(code)
 	if err != nil {
@@ -495,32 +540,49 @@ func (s *Service) Bars(ctx context.Context, code string, p contract.Period, limi
 		}
 	}
 
-	if adj != contract.AdjustNone {
-		bars, err := s.eastMoneyBars(ctx, parsed, p, limit, adj)
-		if err == nil {
+	// 官方 API 优先：日/周/月都支持，且 none/forward/backward 三档复权都可信。
+	// 分钟线官方不提供（ErrPeriodUnsupported），直接落到原有链路。
+	if bars, err := s.fuyaoBars(ctx, parsed, p, limit, adj); err == nil {
+		s.cache.put(cacheKey, bars, ttlBars)
+		return lastBars(bars, limit), nil
+	} else if !errors.Is(err, ErrPeriodUnsupported) && !errors.Is(err, ErrNoData) {
+		s.log.Debug("官方 K 线失败，降级到现有链路", "code", parsed.Raw, "period", p, "adjust", adj, "error", err)
+	}
+
+	switch adj {
+	case contract.AdjustQfq:
+		bars, txErr := s.tencentBarsQfq(ctx, parsed, p, limit)
+		if txErr == nil {
 			s.cache.put(cacheKey, bars, ttlBars)
 			return lastBars(bars, limit), nil
 		}
-		return nil, fmt.Errorf("%w（%s 复权需要东财 K 线接口，本次失败：%v）；请改用不复权", ErrAdjustUnsupported, adj, err)
+		return nil, fmt.Errorf("%w（前复权走腾讯 fqkline，本次失败：%v）；请改用不复权", ErrAdjustUnsupported, txErr)
+	case contract.AdjustHfq:
+		// 后复权同样由腾讯 fqkline 提供（键 hfqday/hfqweek/hfqmonth），不再依赖东财。
+		bars, txErr := s.tencentBarsHfq(ctx, parsed, p, limit)
+		if txErr == nil {
+			s.cache.put(cacheKey, bars, ttlBars)
+			return lastBars(bars, limit), nil
+		}
+		return nil, fmt.Errorf("%w（后复权走腾讯 fqkline hfq，本次失败：%v）；请改用前复权或不复权", ErrAdjustUnsupported, txErr)
 	}
 
 	var (
 		bars   []contract.Bar
 		srcErr []string
 	)
-	if symbol := parsed.THSSymbol(); symbol != "" {
-		bars, err = s.thsBars(ctx, parsed, p, limit)
-		if err == nil {
-			s.cache.put(cacheKey, bars, ttlBars)
-			return lastBars(bars, limit), nil
-		}
-		srcErr = append(srcErr, "同花顺: "+err.Error())
-	}
-	if bars, err = s.eastMoneyBars(ctx, parsed, p, limit, contract.AdjustNone); err == nil {
+	// 不复权顺序：腾讯原始序列 → 新浪日线 → 同花顺兜底。
+	//
+	// 老顺序是「同花顺优先」，但实测同花顺 v6 line 返回的是**前复权**序列（证据见
+	// tencent_kline.go 顶部），拿它当「不复权」会让技术研判/回测建立在已经除权调整过的价格上。
+	// 所以顺序改成先取真正的不复权源；新浪只覆盖日线，放在腾讯之后。
+	// 同花顺保留为最后兜底（它覆盖指数/周/月且最稳），但只有在前面全部失败时才会用到，
+	// 那时口径是降级事实而不是承诺 —— 本层没有字段能标注，上层（plugins/kline）需按 warning 说明。
+	if bars, err = s.tencentBarsRaw(ctx, parsed, p, limit); err == nil {
 		s.cache.put(cacheKey, bars, ttlBars)
 		return lastBars(bars, limit), nil
 	} else {
-		srcErr = append(srcErr, "东财: "+err.Error())
+		srcErr = append(srcErr, "腾讯原始: "+err.Error())
 	}
 	if symbol := parsed.MarketSymbol(); symbol != "" && p == contract.PeriodDay {
 		if bars, err = s.sinaBars(ctx, symbol, limit); err == nil {
@@ -528,6 +590,14 @@ func (s *Service) Bars(ctx context.Context, code string, p contract.Period, limi
 			return lastBars(bars, limit), nil
 		}
 		srcErr = append(srcErr, "新浪: "+err.Error())
+	}
+	if symbol := parsed.THSSymbol(); symbol != "" {
+		bars, err = s.thsBars(ctx, parsed, p, limit)
+		if err == nil {
+			s.cache.put(cacheKey, bars, ttlBars)
+			return lastBars(bars, limit), nil
+		}
+		srcErr = append(srcErr, "同花顺: "+err.Error())
 	}
 	return nil, fmt.Errorf("%w: %s %s（%s）", ErrNoData, parsed.Raw, p, strings.Join(srcErr, "；"))
 }
@@ -550,7 +620,8 @@ func (s *Service) thsBars(ctx context.Context, code Code, p contract.Period, lim
 		if err != nil {
 			return nil, err
 		}
-		return data.Bars, nil
+		// last.js 固定回最近 140 根；调用方要多少给多少，多的截掉。
+		return lastBars(data.Bars, limit), nil
 	}
 
 	// 日线：从当年往回逐年抓，直到凑够 limit 或最多回看 5 年
@@ -603,38 +674,6 @@ func lastBars(bars []contract.Bar, limit int) []contract.Bar {
 	return bars[len(bars)-limit:]
 }
 
-// eastMoneyBars 从东财拉 K 线（唯一能提供复权的来源）。
-func (s *Service) eastMoneyBars(ctx context.Context, code Code, p contract.Period, limit int, adj contract.Adjust) ([]contract.Bar, error) {
-	secid := code.SecID()
-	if secid == "" {
-		return nil, fmt.Errorf("%w: %s", ErrNoData, code.Raw)
-	}
-	klt, ok := emPeriodCodes[p]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrPeriodUnsupported, p)
-	}
-	adjust := 0
-	switch adj {
-	case contract.AdjustQfq:
-		adjust = 1
-	case contract.AdjustHfq:
-		adjust = 2
-	}
-	body, err := s.client.get(ctx, request{
-		source:  sourceEastMoney,
-		url:     emKlineURL(secid, klt, adjust, limit),
-		referer: "https://quote.eastmoney.com/",
-	})
-	if err != nil {
-		return nil, err
-	}
-	data, err := parseEMKline(body)
-	if err != nil {
-		return nil, err
-	}
-	return data.Bars, nil
-}
-
 // sinaBars 是新浪日 K 线兜底（sina.cn 不在默认白名单内，被 Guard 拒绝时按失败处理）。
 func (s *Service) sinaBars(ctx context.Context, symbol string, limit int) ([]contract.Bar, error) {
 	body, err := s.client.get(ctx, request{
@@ -650,7 +689,14 @@ func (s *Service) sinaBars(ctx context.Context, symbol string, limit int) ([]con
 
 // ---------- 资金流 ----------
 
-// StockFundFlow 返回个股最新资金流：东财优先，新浪兜底。
+// StockFundFlow 返回个股最新资金流，来源是新浪 MoneyFlow.ssi_ssfx_flzjtj（唯一来源）。
+//
+// 口径说明（与旧东财口径的差异，前端/Agent 需要知道）：
+//   - SuperNet/LargeNet/MediumNet/SmallNet = 新浪 r0/r1/r2/r3 的 (in - out)，即「超大/大/中/小单净额」，
+//     与东财同名口径一致（都是净额，单位元）；
+//   - MainNet = r0_net + r1_net（超大单 + 大单），与东财「主力净额 = 大单 + 超大单」同义；
+//   - 新浪没有「主力净占比」字段，MainPct 用 MainNet / |netamount 当量| 计算，
+//     分母是新浪的「全部资金净额」，与东财 f184 的分母（成交额）不同，只能作强弱参考。
 func (s *Service) StockFundFlow(ctx context.Context, code string) (contract.FundFlow, error) {
 	parsed, err := ParseCode(code)
 	if err != nil {
@@ -660,36 +706,6 @@ func (s *Service) StockFundFlow(ctx context.Context, code string) (contract.Fund
 	if cached, ok := s.cache.get(cacheKey); ok {
 		if flow, isFlow := cached.(contract.FundFlow); isFlow {
 			return flow, nil
-		}
-	}
-
-	if secid := parsed.SecID(); secid != "" {
-		body, err := s.client.get(ctx, request{
-			source:  sourceEastMoney,
-			url:     emFFlowURL(secid),
-			referer: "https://quote.eastmoney.com/",
-		})
-		if err == nil {
-			flow, parseErr := parseEMFFlow(body)
-			if parseErr == nil {
-				out := contract.FundFlow{
-					Code:      parsed.Symbol,
-					Name:      flow.Name,
-					Kind:      string(KindStock),
-					Date:      flow.Date,
-					MainNet:   flow.MainNet,
-					SuperNet:  flow.SuperNet,
-					LargeNet:  flow.LargeNet,
-					MediumNet: flow.MediumNet,
-					SmallNet:  flow.SmallNet,
-					Source:    sourceEastMoney,
-				}
-				s.cache.put(cacheKey, out, ttlFlow)
-				return out, nil
-			}
-			s.log.Debug("东财资金流解析失败", "code", code, "error", parseErr)
-		} else {
-			s.log.Debug("东财资金流失败，转新浪兜底", "code", code, "error", err)
 		}
 	}
 
@@ -724,10 +740,27 @@ func (s *Service) StockFundFlow(ctx context.Context, code string) (contract.Fund
 	return out, nil
 }
 
-// FundFlowRank 返回板块或概念的资金流排名（主力净流入降序）。
+// FundFlowRank 返回板块或概念的资金流排名（主力净流入降序），等价于 FundFlowRankBy(..., "in", ...)。
 // kind 为空时默认 sector（product 要求空参数不报错）；limit<=0 默认 10。
 func (s *Service) FundFlowRank(ctx context.Context, kind string, limit int) ([]contract.FundFlow, error) {
+	return s.FundFlowRankBy(ctx, kind, "in", limit)
+}
+
+// FundFlowRankBy 返回板块或概念的资金榜：direction=in 为净流入降序，
+// out 为净流出（净额升序，最负在前），all 兼容旧行为（净额降序）。
+// kind 为空默认 sector，direction 为空默认 in，limit<=0 默认 10，上限 100。
+//
+// 数据源固定为新浪 MoneyFlow.ssl_bkzj_bk（fenlei=0 行业 / 1 概念）。
+// 口径差异（重要）：MainNet 是新浪的「全部资金净额 netamount」（inamount - outamount），
+// 不是旧东财口径的「主力净额（大单 + 超大单）」。新浪这个榜单没有主力/超大单拆分，
+// 因此 SuperNet/LargeNet 等字段留 0；前端与 Agent 需要把榜单读成「资金净额榜」而不是「主力榜」。
+// MainPct 来自 ratioamount（净额 / 成交额），ChangePct 来自 avg_changeratio，两者都乘 100 转成百分数。
+func (s *Service) FundFlowRankBy(ctx context.Context, kind, direction string, limit int) ([]contract.FundFlow, error) {
 	normalized, err := normalizeSectorKind(kind)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := normalizeRankDirection(direction)
 	if err != nil {
 		return nil, err
 	}
@@ -737,78 +770,72 @@ func (s *Service) FundFlowRank(ctx context.Context, kind string, limit int) ([]c
 	if limit > maxRankLimit {
 		limit = maxRankLimit
 	}
-	cacheKey := fmt.Sprintf("flow:rank:%s:%d", normalized, limit)
+	cacheKey := fmt.Sprintf("flow:rank:%s:%s:%d", normalized, dir, limit)
 	if cached, ok := s.cache.get(cacheKey); ok {
 		if items, isItems := cached.([]contract.FundFlow); isItems {
 			return items, nil
 		}
 	}
-	body, err := s.client.get(ctx, request{
-		source:  sourceEastMoney,
-		url:     emSectorFlowURL(normalized, limit),
-		referer: "https://data.eastmoney.com/",
-	})
+	out, err := s.rankFromSina(ctx, normalized, dir, limit)
 	if err != nil {
-		return nil, err
-	}
-	rows, err := parseEMBkzj(body)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]contract.FundFlow, 0, limit)
-	for i, row := range rows {
-		if len(out) >= limit {
-			break
-		}
-		out = append(out, contract.FundFlow{
-			Code:    row.Code,
-			Name:    row.Name,
-			Kind:    string(normalized),
-			MainNet: row.MainNet,
-			Rank:    i + 1,
-			Source:  sourceEastMoney,
-		})
+		return nil, fmt.Errorf("取板块资金流排名失败: %w", err)
 	}
 	s.cache.put(cacheKey, out, ttlFlow)
 	return out, nil
 }
 
-// Sectors 返回板块或概念列表（含涨跌幅与主力净额）。kind 为空时默认 sector。
+// normalizeRankDirection 归一资金榜方向：空串默认 in，只接受 in/out/all。
+func normalizeRankDirection(direction string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(direction)) {
+	case "", "in":
+		return "in", nil
+	case "out":
+		return "out", nil
+	case "all":
+		return "all", nil
+	default:
+		return "", fmt.Errorf("datasource: direction 只支持 in/out/all，实际 %q", direction)
+	}
+}
+
+// Sectors 返回板块或概念列表（含涨跌幅与净流入）。kind 为空时默认 sector。
+//
+// 数据源是新浪 Market_Center.getHQNodes 的节点树：
+//   - 行业板块取「新浪行业」这一组（new_xxxx 形如 new_dzxx 电子行业）；
+//   - 概念板块取「概念板块」这一组（gn_xxxx 形如 gn_hwqc 华为汽车）。
+//
+// 返回的 Code 就是新浪 category —— 这是本应用唯一认可的板块代码形态，
+// 可以直接传给 FundFlowRankBy / SectorFundFlowHistory / SectorFundFlowBatch。
+// 旧东财 BK 代码（BK1201）已经不受支持，调用那些接口传 BK 代码会得到可操作的中文错误。
+// 涨跌幅与净流入不在目录接口里，需要实时数值时交给 FundFlowRankBy（同一套新浪口径）。
 func (s *Service) Sectors(ctx context.Context, kind string) ([]contract.Sector, error) {
 	normalized, err := normalizeSectorKind(kind)
 	if err != nil {
 		return nil, err
 	}
-	const sectorLimit = 100
 	cacheKey := "sectors:" + string(normalized)
 	if cached, ok := s.cache.get(cacheKey); ok {
 		if items, isItems := cached.([]contract.Sector); isItems {
 			return items, nil
 		}
 	}
-	body, err := s.client.get(ctx, request{
-		source:  sourceEastMoney,
-		url:     emSectorListURL(normalized, sectorLimit),
-		referer: "https://quote.eastmoney.com/",
-	})
+	entries, err := s.sinaSectorCatalog(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := parseEMClist(body)
-	if err != nil {
-		return nil, err
+	rows := entries[normalized]
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("%w: 新浪板块目录里没有 %s 分类", ErrNoData, normalized)
 	}
 	out := make([]contract.Sector, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, contract.Sector{
-			Code:      row.Code,
-			Name:      row.Name,
-			Kind:      string(normalized),
-			ChangePct: row.ChangePct,
-			MainNet:   row.MainNet,
+			Code: row.Code,
+			Name: row.Name,
+			Kind: string(normalized),
 		})
 	}
-	s.cache.put(cacheKey, out, ttlFlow)
+	s.cache.put(cacheKey, out, ttlSinaFlow*5)
 	return out, nil
 }
 
@@ -826,7 +853,7 @@ func normalizeSectorKind(kind string) (Kind, error) {
 
 // ---------- 搜索 ----------
 
-// Search 按关键词搜代码：东财 suggest 优先，腾讯 smartbox 兜底。
+// Search 按关键词搜代码：腾讯 smartbox（唯一来源）。
 func (s *Service) Search(ctx context.Context, keyword string) ([]contract.StockRef, error) {
 	text := strings.TrimSpace(keyword)
 	if text == "" {
@@ -839,23 +866,11 @@ func (s *Service) Search(ctx context.Context, keyword string) ([]contract.StockR
 		}
 	}
 
-	var suggestions []StockSuggestion
-	if body, err := s.client.get(ctx, request{source: sourceEastMoney, url: emSuggestURL(text, defaultSearchCap)}); err == nil {
-		if parsed, parseErr := parseEMSuggest(body); parseErr == nil {
-			suggestions = parsed
-		} else {
-			s.log.Debug("东财搜索解析失败，转腾讯兜底", "error", parseErr)
-		}
-	} else {
-		s.log.Debug("东财搜索失败，转腾讯兜底", "error", err)
+	body, err := s.client.get(ctx, request{source: sourceTencent, url: txSuggestURL(text)})
+	if err != nil {
+		return nil, err
 	}
-	if len(suggestions) == 0 {
-		body, err := s.client.get(ctx, request{source: sourceTencent, url: txSuggestURL(text)})
-		if err != nil {
-			return nil, err
-		}
-		suggestions = parseTxSuggest(body)
-	}
+	suggestions := parseTxSuggest(body)
 
 	out := make([]contract.StockRef, 0, len(suggestions))
 	seen := make(map[string]bool, len(suggestions))
@@ -886,6 +901,11 @@ func (s *Service) Search(ctx context.Context, keyword string) ([]contract.StockR
 // Health 返回各数据源最近一次调用结果（不发新请求，避免状态栏刷新打出网络风暴）。
 func (s *Service) Health(_ context.Context) map[string]string {
 	out := s.client.health()
+	// 官方 API 可能「已配置但还没被调用过」：用配置状态覆盖“未使用”，
+	// 让设置页一眼看出 Key 是否已生效（调用失败时仍保留 client 记录的错误）。
+	if note, ok := out[sourceFuyao]; ok && (note == "未使用" || note == "") {
+		out[sourceFuyao] = s.fuyaoHealth()
+	}
 	out[sourceStore] = s.storeHealth()
 	out["cache"] = fmt.Sprintf("%d 项", s.cache.size())
 	return out

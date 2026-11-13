@@ -21,6 +21,8 @@ type fakeLLM struct {
 	calls   int
 	entered int
 	seen    [][]contract.Message
+	// models 记录每次请求的 Model 参数（验证模型选择透传到 LLM）。
+	models []string
 	// block 不为 nil 时 Chat/Stream 会阻塞到 ctx 结束，用来测超时与 Stop。
 	block chan struct{}
 	// blockFirst 只阻塞第 1 次调用，用来测"运行中插话"。
@@ -29,6 +31,8 @@ type fakeLLM struct {
 	afterCall func(n int)
 	// usage 不为 nil 时按它返回 token 用量，用来测 usage 兜底口径。
 	usage *contract.Usage
+	// window 是模型上下文窗口（上下文百分比测试用；0 表示未知）。
+	window int
 }
 
 func (f *fakeLLM) next() (contract.Message, error) {
@@ -47,6 +51,17 @@ func (f *fakeLLM) record(req contract.ChatRequest) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seen = append(f.seen, append([]contract.Message{}, req.Messages...))
+	f.models = append(f.models, req.Model)
+}
+
+// modelAt 返回第 i 次模型请求使用的模型（越界返回空串）。
+func (f *fakeLLM) modelAt(i int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i < 0 || i >= len(f.models) {
+		return ""
+	}
+	return f.models[i]
 }
 
 func (f *fakeLLM) Chat(ctx context.Context, req contract.ChatRequest) (contract.Reply, error) {
@@ -95,11 +110,11 @@ func (f *fakeLLM) Stream(ctx context.Context, req contract.ChatRequest, onDelta 
 }
 
 func (f *fakeLLM) Models(context.Context) ([]contract.ModelInfo, error) {
-	return []contract.ModelInfo{{Provider: "fake", Model: "fake", HasKey: true, IsDefault: true}}, nil
+	return []contract.ModelInfo{{Provider: "fake", Model: "fake", HasKey: true, IsDefault: true, ContextWindow: f.window}}, nil
 }
 
 func (f *fakeLLM) Default(context.Context) (contract.ModelInfo, error) {
-	return contract.ModelInfo{Provider: "fake", Model: "fake", HasKey: true, IsDefault: true}, nil
+	return contract.ModelInfo{Provider: "fake", Model: "fake", HasKey: true, IsDefault: true, ContextWindow: f.window}, nil
 }
 
 func (f *fakeLLM) callCount() int {
@@ -343,10 +358,17 @@ func TestRouterFastPathAndDedupe(t *testing.T) {
 		{RouteInput{Worker: "plan"}, WorkerPremarket},
 		{RouteInput{Worker: "review"}, WorkerPostmarket},
 		{RouteInput{Worker: "unknown-thing"}, WorkerChat},
-		{RouteInput{Input: "帮我复盘一下今天的涨停梯队"}, WorkerPostmarket},
-		{RouteInput{Input: "回测一下首板次日溢价"}, WorkerQuant},
-		{RouteInput{Input: "盯盘提醒我异动"}, WorkerIntraday},
-		{RouteInput{Input: "什么是集合竞价"}, WorkerChat},
+		{RouteInput{Worker: "chat"}, WorkerChat},
+		// 空 worker 是默认对话入口：总控（不再按关键词自动分派）。
+		{RouteInput{}, WorkerRouter},
+		{RouteInput{Input: "帮我复盘一下今天的涨停梯队"}, WorkerRouter},
+		{RouteInput{Worker: "router", Input: "帮我复盘一下今天的涨停梯队"}, WorkerRouter},
+		{RouteInput{Worker: "总控"}, WorkerRouter},
+		// worker=auto 保留旧的关键词规则分派。
+		{RouteInput{Worker: "auto", Input: "帮我复盘一下今天的涨停梯队"}, WorkerPostmarket},
+		{RouteInput{Worker: "auto", Input: "回测一下首板次日溢价"}, WorkerQuant},
+		{RouteInput{Worker: "auto", Input: "盯盘提醒我异动"}, WorkerIntraday},
+		{RouteInput{Worker: "auto", Input: "什么是集合竞价"}, WorkerChat},
 	}
 	for _, c := range cases {
 		d, err := r.Plan(context.Background(), c.in)
@@ -394,7 +416,7 @@ func TestRouterSlowPathUsesModel(t *testing.T) {
 		{Role: contract.RoleAssistant, Content: `{"worker":"quant","intent":"因子研究"}`},
 	}}
 	r := NewRouter(time.Now, llm)
-	d, err := r.Plan(context.Background(), RouteInput{Input: "帮我看看这个思路能不能赚钱"})
+	d, err := r.Plan(context.Background(), RouteInput{Worker: "auto", Input: "帮我看看这个思路能不能赚钱"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +430,7 @@ func TestRouterSlowPathUsesModel(t *testing.T) {
 	// 模型返回垃圾时回落到规则/聊天。
 	bad := &fakeLLM{script: []contract.Message{{Role: contract.RoleAssistant, Content: "不是 JSON"}}}
 	r2 := NewRouter(time.Now, bad)
-	d2, err := r2.Plan(context.Background(), RouteInput{Input: "随便聊聊"})
+	d2, err := r2.Plan(context.Background(), RouteInput{Worker: "auto", Input: "随便聊聊"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,10 +461,15 @@ func TestTradingPhase(t *testing.T) {
 }
 
 func TestWorkerPromptsTeachDisclosure(t *testing.T) {
-	if len(Workers()) != 5 {
-		t.Fatalf("应有 5 个 worker，实际 %d", len(Workers()))
+	if len(Workers()) != len(workerMetas) {
+		t.Fatalf("内置 worker 数应等于 workerMetas %d，实际 %d", len(workerMetas), len(Workers()))
 	}
-	for _, w := range Workers() {
+	if len(Workers()) != 1 || Workers()[0].ID != WorkerRouter {
+		t.Fatalf("内置常驻 worker 只应有总控，实际 %+v", Workers())
+	}
+	// 内置 + 预设的 system prompt 都必须教三级披露（预设落成自定义 worker 时用的是同一份 prompt）。
+	specs := append(Workers(), presetWorkerSpecs()...)
+	for _, w := range specs {
 		for _, keyword := range []string{"tool.search", "tool.describe", "tool.call", "skill.list", "kb.search"} {
 			if !strings.Contains(w.System, keyword) {
 				t.Fatalf("%s 的 system prompt 必须教三级披露（缺 %s）", w.ID, keyword)
@@ -452,11 +479,23 @@ func TestWorkerPromptsTeachDisclosure(t *testing.T) {
 			t.Fatalf("%s 必须明确禁止猜工具名", w.ID)
 		}
 	}
-	if _, ok := LookupWorker("review"); !ok {
-		t.Fatal("别名 review 应能解析到 postmarket")
+	// 旧 id 的别名解析走运行时（LookupWorker 只查内置表，现在只有总控）。
+	rt := &Runtime{custom: NewCustomWorkerStore(nil), templates: NewTemplateStore(nil)}
+	if spec, ok := rt.lookupWorker("review"); !ok || spec.ID != WorkerPostmarket {
+		t.Fatalf("别名 review 应能解析到 postmarket，实际 %+v ok=%v", spec, ok)
+	}
+	// 空 id 归一化到总控：默认对话入口就是总控。
+	if spec, ok := LookupWorker(""); !ok || spec.ID != WorkerRouter {
+		t.Fatalf("空 worker 应回落到总控，实际: %+v ok=%v", spec, ok)
+	}
+	if got := NormalizeWorker("chat"); got != WorkerChat {
+		t.Fatalf("显式 chat 必须仍是普通问答，实际 %s", got)
 	}
 	// 未知 worker 回落到 chat，而不是报错卡住前端。
-	if spec, ok := LookupWorker("不存在"); !ok || spec.ID != WorkerChat {
-		t.Fatalf("未知 worker 应回落到 chat，实际: %+v ok=%v", spec, ok)
+	if got := NormalizeWorker("不存在"); got != WorkerChat {
+		t.Fatalf("未知 worker 应归一化成 chat，实际 %s", got)
+	}
+	if spec, ok := rt.lookupWorker("不存在"); !ok || spec.ID != WorkerChat {
+		t.Fatalf("未知 worker 应能解析成 chat，实际: %+v ok=%v", spec, ok)
 	}
 }

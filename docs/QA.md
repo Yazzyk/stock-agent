@@ -6,6 +6,8 @@
 > 只记录实测。三态沿用 ACCEPTANCE §0：PASS / FAIL / BLOCKED，不写"部分通过"。
 > 所有命令都在仓库根目录执行；`~/.guanlan` 是真实数据目录，QA 的 live 测试用**临时目录**跑，不污染它。
 
+> **现状说明（2026-11-12）**：本文件是 2026-11-10 的历史验收记录，**结论按当时口径原样保留、不再改写**。此后有三处变化：① 数据层已彻底移除东方财富（无 eastmoney 代码、无任何 push2 / data.eastmoney / quote.eastmoney 请求，网络白名单也删除了 eastmoney.com），现在只有同花顺 / 腾讯 / 新浪三家上游；② Token 默认不设预算上限（`Policy.MaxTokensPerRun=0`），停机只由「单次运行工具调用上限」与模型单次输出上限决定；③ Agent 工作台的上下文与编队 UI 已按 dsh-context 重做（上下文标签页、全宽编队页、只有总控有对话框）。文中出现的东财端点、东财兜底/降级链路、`smoke.sh` 对 push2 主机的探测，都属于历史记录，**不代表当前行为**。
+
 ---
 
 ## 0. QA 资产入口
@@ -17,7 +19,7 @@
 | `scripts/verify.sh --with-race` | 追加 `go test -race ./...` | 同上 |
 | `scripts/verify.sh --with-wails` | 追加 `wails build -clean`（会删 dist，仅集成用） | 同上 |
 | `scripts/verify.sh --expect-plugins=N` | 插件装配数下限，默认 **8**（watchlist/fundflow/kline/agentlab/knowledge/modelsettings/quant/watch）；工具索引下限常量 `EXPECT_TOOLS=27`；都可传 0 关闭 | 同上 |
-| `scripts/smoke.sh` | 5 个行情端点形状断言 + 东财 K 线主机探测；失败只 WARN | 恒 0（网络问题不判死） |
+| `scripts/smoke.sh` | 8 个行情端点形状断言（THS K 线/涨停池/龙虎榜、新浪板块榜/多日资金流/个股资金流、腾讯快照/hfq），**不含任何东财主机探测**；失败只 WARN | 恒 0（网络问题不判死） |
 | `go test ./test/ -count=1` | 外部契约/不变量测试（63 个测试函数 / 145 个用例） | go test 语义 |
 | `go test -tags live ./test/ -run TestLive -v` | 端到端联网验收（临时数据目录，验证 R3/R6/R7/R8 的真实链路） | go test 语义 |
 | `go test -tags live ./internal/bootstrap/ -run TestLive -v` | 数据层联网验收（lead 维护） | go test 语义 |
@@ -44,7 +46,7 @@
 | R3 数据层与存储 | backend-data | **PASS**（附 2 条口径缺口） | `--task=quote -- 600000`；`--task=bars -- 600000 day 60`；`go test -tags live ./test/ -run TestLiveEndToEnd`；`./scripts/smoke.sh` | quote：`{"code":"600000","name":"浦发银行","market":"sh","price":10.2,"prevClose":10.1,"changePct":0.99,"source":"ths"}`；bars 60 根日期严格递增、close>0；live E2E：60/60 根、source=ths；smoke 5/5 PASS。缺口：**qfq/hfq 不可用（东财 kline 端点不可达）→ 显式降级 `adjust=none` + warning；min15/5/1 周期不支持**（见第 5 节） |
 | R4 回测引擎与策略 | backend-data | **PASS（引擎/不变量）/ BLOCKED（quant 报告需模型）** | `go test ./internal/backtest/ -count=1`；`go test ./test/ -run TestBacktest`；`go run . --headless --task=quant` | 引擎 11 个用例全绿（含 T+1、涨跌停、停牌、成本、walk-forward、样本内外）；QA 另有 3 条独立不变量（无未来函数/成本单调/MDD 口径）全绿。`--task=quant` 走 agentlab worker，本机 `Models()` 无 key → `未配置模型：请在"模型设置"里填写 API Key 后再运行`，报告生成 BLOCKED |
 | R5 Agent harness | backend-core | **BLOCKED（QA 环境缺 key）** | `go run . --headless --task=premarket`；`go test -tags live ./test/ -run TestAgent`（离线 fake LLM） | 本机 selftest 显示 `deepseek/deepseek-chat key=false` → premarket fast-fail（符合设计，0 次模型调用、<2s）。lead 侧用真 key 已跑通 8 步 ReAct 并落 plan.md。QA 侧以 fake LLM 覆盖循环不变量：工具结果回填（含 ToolCallID）、步数上限、token 预算、猜错工具名不中断、无模型快速失败，全部 PASS |
-| R6 渐进式披露（工具/技能/知识库） | backend-core | **PASS** | `--task=tools`；`--task=skill.list`；`go test -tags live ./test/ -run 'TestLiveEndToEnd|TestLiveToolSummaries'` | 工具 22 个（≥12 ✓）、风险只出现 read/network/write（无 exec ✓）、**全部 summary ≤40 字**（D9 修复后复跑 TestLiveToolSummaries PASS）；技能 6 个（premarket-plan/postmarket-review/intraday-monitor/kline-reading/fundflow-reading/quant-honesty）✓；kb.search 真实命中 `题材与情绪周期 score=6.3602`（标题+片段+分数 ✓）；L1 预算/describe/技能越界/KB top1 稳定性见第 3 节 |
+| R6 渐进式披露（工具/技能/知识库） | backend-core | **PASS** | `--task=tools`；`--task=skill.list`；`go test -tags live ./test/ -run 'TestLiveEndToEnd|TestLiveToolSummaries'` | 工具 22 个（≥12 ✓）、风险只出现 read/network/write（无 exec ✓）、**全部 summary ≤40 字**（D9 修复后复跑 TestLiveToolSummaries PASS）；技能 10 个（原有 6 个 + 导入 champion-limitup-playbook/ultra-short-trading/youzi-tracker/humanizer-zh）✓；kb.search 真实命中 `题材与情绪周期 score=6.3602`（标题+片段+分数 ✓）；L1 预算/describe/技能越界/KB top1 稳定性见第 3 节 |
 | R7 自选股同步 | backend-data + watchlist | **PASS** | `go run . --headless --task=watchlist`；`go test -tags live ./test/ -run TestLiveWatchlist -v` | 163 条、20 个分组，code/name/market/group/order 齐全且名称为可读中文（`上海九百`/`冰山冷热`/`大业股份`…），无凭证泄露、不 panic；条目 `source=ths-local`（与同步来源同名，D13 已定稿）。D10 的 GBK 乱码已由 backend-data 修复（`TestLiveWatchlist` PASS，badNames=0） |
 | R8 资金流与 K 线面板 | backend-data + frontend | **PASS** | `--task=flow.rank`；`--task=sector.list`；`cd frontend && npm run build` | flow.rank：电子 主力净额 `9201537792`（元，9.2e9 落在 1e7–1e11 区间 ✓）；sector.list：100 条含 changePct/mainNet；前端 `vue-tsc --noEmit && vite build` PASS（verify.sh 实测约 2s） |
 | R9 安全与一键验收 | lead + qa | **PASS** | `selftest | grep -E "sk-|Bearer |token="`；`tools | grep -c "\[exec\]"`；`verify.sh`；`go test -race ./...` | 密钥特征 **0**；exec 工具 **0**；`verify.sh --with-network --with-race` **10/10 PASS**；`-race` 18 个包全绿无 DATA RACE；落盘仅在 `~/.guanlan`（DB/审计/会话/知识库）；`wails build -clean` 由 lead 跑通（build/bin/guanlan.app） |
@@ -277,3 +279,59 @@ go run . --headless --task=kb.search
 ```
 
 判定口径：**`verify.sh` 退出码 0 + R1–R9 全 PASS 才算验收通过**；BLOCKED 必须写清依赖与归属，不接受"没跑但应该没问题"。
+
+## 8. 本轮（R11）验证记录（2026-11-10 / 11）
+
+### 8.1 命令与真实结果
+
+```sh
+go build ./...                                  # exit 0
+go vet ./...                                    # exit 0
+go test ./... -count=1                          # 24 个包全 ok（含 test/ 1.1s）
+go run . --headless --task=selftest             # 插件 10/10 激活、停用 0、工具 39、面板 10、结果 OK
+go run . --headless --task=tools                # 29 条工具索引（含 watch.check / flow.history / agent.spawn）
+cd frontend && npx vue-tsc --noEmit             # exit 0
+cd frontend && npm run build                    # exit 0，87 modules，dist 约 209KB JS
+```
+
+### 8.2 新增测试（本轮）
+
+| 包 | 覆盖 |
+|---|---|
+| internal/agent | 模板保存/恢复/校验、调度时间窗与当天去重、上下文估算、spawn 深度/并发/取消级联（27 个新用例） |
+| internal/datasource | sync check 三源分支、cookie 先验证后落盘、Safari 解析、资金流 daykline/ulist 解析与空响应 |
+| internal/backtest | fills 逐笔成交与 500 条截断 |
+| internal/llm | 预设契约数值、JSON 字段名锁定、Save 默认 maxTokens/contextWindow |
+| internal/kernel | 停用插件 skipped/disabled、依赖停用文案、Start 后拒绝热停用 |
+| plugins/console | inventory 形状、setEnabled 重启提示、policy 脱敏、受保护插件 |
+| plugins/watchlist/fundflow/quant | 方法数/工具数、history/batch、trades 顶层形状 |
+
+### 8.3 演示模式 UI 验证（1280×800，逐页截图）
+
+自选（向导 + 资金列 + sticky 操作列）、资金流（200px 多日图 + 排名 + 摘要）、K 线（chips/指标/读数条/缩放）、量化（StockPicker + K 线 B/S + 净值）、Agent 工作台（三张值班卡 + 上下文环 3.8% ~37.6K/1M + 编队 1 主 2 子）、模型设置（官方预设下拉 + 自动 maxTokens）、设置中心（9 插件/25 工具/审计/策略）、知识库、Watch 哨兵。
+
+### 8.4 未覆盖 / 已知缺口
+
+- 同步向导的 **真实** 完全磁盘访问授权与同花顺网页登录未在 CI 触发（需要人工授权/登录）；单测覆盖分支，UI 用 mock 验证。
+- 自动值班的节假日判断仍是工作日近似；90 分钟补跑宽限是产品口径（已写进代码注释与 UI）。
+- 资金流 `history` 仅个股；板块/概念多日历史未做。
+- 真实 Wails 窗口内 `BrowserOpenURL` 深链行为未在无 GUI 环境验证；浏览器预览会提示"未连接桌面内核"。
+- `--with-wails` 的 `wails build -clean` 需在交付前由 lead 跑一次（本轮已跑，见交付报告）。
+
+### 8.5 数据源实测（2026-11-11 01:0x，真实网络）
+
+| 链路 | 结果 | 证据 |
+|---|---|---|
+| 行情快照 | 正常 | 600000 四路一致：THS 10.20 / 腾讯 10.20 / 新浪 10.20 / 东财 f43=1020；最新交易日 2026-11-10 |
+| 前复权 K 线 | 正常（东财 K 线端点不可达，降级腾讯） | 600519 除权日 2026-06-26 前：qfq 1179.66（THS/腾讯 qfq 一致），raw 1207.68；除权后 1439.00 |
+| 不复权 K 线 | 正常（东财→腾讯原始→新浪→THS） | 600519 2026-06-24 none=1207.68；与 qfq 分叉 28.02 元 |
+| 个股资金流 | 正常 | 600519 2026-11-10：daykline f52=99,230,912；ulist f62=99,230,912；超大/大/中/小四项与主力自洽 |
+| 板块/概念排名 | 正常 | flow.rank 返回 BK 代码、名称、主力净额、涨跌幅 |
+| 自选同步 | 正常 | 本机同花顺容器解析出分组与标的（source=ths） |
+| 东财 K 线端点 | 异常 | push2 / push2his 的 `/api/qt/stock/kline/get` 返回 HTTP 000/502、body 空；不影响行情/资金流/板块 |
+
+**go-stock 对照**：go-stock 使用 `github.com/bensema/gotdx`（通达信 TCP 协议），
+`NewMAC/MACHosts` 连接 TDX MAC 行情服务器（7709），用于板块列表、成分股报价、异动；
+K 线走 `StockKLine(..., types.AdjustQFQ)`；另有东财/Sina/Tencent 与 chromedp 兜底。
+本机实测 TDX 主站 121.36.248.138:7709、123.60.47.136:7709、121.37.207.165:7709 与 ICFQS 7615 均可连通。
+观澜当前不需要引入 TDX 即可修正 K 线口径；若后续要板块成分股/集合竞价/异动，再接 gotdx。

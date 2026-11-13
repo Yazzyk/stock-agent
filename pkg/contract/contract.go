@@ -130,6 +130,47 @@ type SyncResult struct {
 	NeedFullDiskAccess bool     `json:"needFullDiskAccess"`
 	Warnings           []string `json:"warnings"`
 	Source             string   `json:"source,omitempty"`
+	// Check 是同步完成后回填的最新前置诊断，前端据此继续引导或收起向导。
+	Check *SyncCheck `json:"check,omitempty"`
+}
+
+// SyncSource 是三级同步来源之一的探测结果（只读诊断）。
+type SyncSource struct {
+	ID        string `json:"id"` // ths-local | ths-web | manual
+	Label     string `json:"label"`
+	Available bool   `json:"available"`
+	State     string `json:"state"` // ok | denied | no-login | missing | empty
+	Detail    string `json:"detail,omitempty"`
+	Groups    int    `json:"groups,omitempty"`
+	Items     int    `json:"items,omitempty"`
+}
+
+// SyncAction 是向导某一步的可执行动作；前端按 Kind 决定交互方式。
+type SyncAction struct {
+	Kind  string `json:"kind"` // open-url | open-settings | copy | capture-cookie | paste-cookie | retry-sync | none
+	Label string `json:"label"`
+	Value string `json:"value,omitempty"`
+}
+
+// SyncStep 是同步向导的一步。
+type SyncStep struct {
+	ID     string     `json:"id"`
+	Title  string     `json:"title"`
+	Detail string     `json:"detail"`
+	Done   bool       `json:"done"`
+	Action SyncAction `json:"action"`
+}
+
+// SyncCheck 描述同步前置条件（只读诊断，不触发同步）。
+type SyncCheck struct {
+	Local       SyncSource `json:"local"`
+	Web         SyncSource `json:"web"`
+	Manual      SyncSource `json:"manual"`
+	Recommended string     `json:"recommended"` // ths-local | ths-web | manual | none
+	Ready       bool       `json:"ready"`
+	Message     string     `json:"message"`
+	Steps       []SyncStep `json:"steps"`
+	CheckedAt   string     `json:"checkedAt"`
 }
 
 // ---------- 数据服务 ----------
@@ -145,6 +186,54 @@ type DataService interface {
 	SyncTHSWatchlist(ctx context.Context) (SyncResult, error)
 	Search(ctx context.Context, keyword string) ([]StockRef, error)
 	Health(ctx context.Context) map[string]string
+}
+
+// FundFlowPoint 是个股某一交易日的资金流明细（单位：元）。
+type FundFlowPoint struct {
+	Date      string  `json:"date"`
+	MainNet   float64 `json:"mainNet"`
+	SuperNet  float64 `json:"superNet"`
+	LargeNet  float64 `json:"largeNet"`
+	MediumNet float64 `json:"mediumNet"`
+	SmallNet  float64 `json:"smallNet"`
+	MainPct   float64 `json:"mainPct,omitempty"`
+	Close     float64 `json:"close,omitempty"`
+	ChangePct float64 `json:"changePct,omitempty"`
+}
+
+// FundFlowHistory 是个股多日资金流序列。
+type FundFlowHistory struct {
+	Code   string          `json:"code"`
+	Name   string          `json:"name"`
+	Days   int             `json:"days"`
+	Source string          `json:"source,omitempty"`
+	Points []FundFlowPoint `json:"points"`
+}
+
+// FundFlowHistoryService 是 DataService 的可选扩展：实现方（datasource）提供
+// 多日资金流与批量快照；消费者用类型断言，避免扩大 DataService 接口导致所有 stub 连锁改动。
+type FundFlowHistoryService interface {
+	FundFlowHistory(ctx context.Context, code string, days int) (FundFlowHistory, error)
+	FundFlowSnapshot(ctx context.Context, codes []string) ([]FundFlow, error)
+}
+
+// MinutePoint 是分时序列里的一个分钟点。成交量单位是「手」，成交额单位是「元」。
+type MinutePoint struct {
+	Time   string  `json:"time"`
+	Price  float64 `json:"price"`
+	Avg    float64 `json:"avg,omitempty"`
+	Volume float64 `json:"volume,omitempty"`
+	Amount float64 `json:"amount,omitempty"`
+}
+
+// MinuteSeries 是个股/指数某个交易日的分时序列（09:30~15:00，价格按当日实际成交价，不做复权）。
+type MinuteSeries struct {
+	Code      string        `json:"code"`
+	Name      string        `json:"name"`
+	Date      string        `json:"date"`
+	PrevClose float64       `json:"prevClose"`
+	Points    []MinutePoint `json:"points"`
+	Source    string        `json:"source,omitempty"`
 }
 
 // ---------- 持久化 ----------
@@ -183,11 +272,17 @@ type ToolCall struct {
 }
 
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
-	ToolCallID string     `json:"toolCallId,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role    Role   `json:"role"`
+	Content string `json:"content"`
+	// ReasoningContent 是推理模型的思维链（DeepSeek V4 等把正文放 reasoning_content）。
+	// 正文为空而它非空时，调用方必须如实回退到它，而不是当成"模型没返回内容"。
+	ReasoningContent string     `json:"reasoningContent,omitempty"`
+	ToolCalls        []ToolCall `json:"toolCalls,omitempty"`
+	ToolCallID       string     `json:"toolCallId,omitempty"`
+	Name             string     `json:"name,omitempty"`
+	// FinishReason 是上游的结束原因（stop / length / tool_calls / content_filter …）。
+	// 为空表示上游没给；"length" 说明输出被 max_tokens 截断，是空正文的常见根因。
+	FinishReason string `json:"finishReason,omitempty"`
 }
 
 type ToolInfo struct {
@@ -200,6 +295,10 @@ type Usage struct {
 	PromptTokens     int `json:"promptTokens"`
 	CompletionTokens int `json:"completionTokens"`
 	TotalTokens      int `json:"totalTokens"`
+	// CachedTokens 是提示词命中的缓存 token 数（提供方上报；
+	// DeepSeek 的 prompt_cache_hit_tokens 与 OpenAI 的 prompt_tokens_details.cached_tokens
+	// 都会被适配层归一到这里；上游没给时为 0，不要自行估算）。
+	CachedTokens int `json:"cachedTokens,omitempty"`
 }
 
 type ChatRequest struct {
@@ -226,6 +325,8 @@ type ModelInfo struct {
 	HasKey      bool   `json:"hasKey"`
 	IsDefault   bool   `json:"isDefault"`
 	MaxTokens   int    `json:"maxTokens,omitempty"`
+	// ContextWindow 是模型上下文窗口（token），来自 provider 预设；未知为 0。
+	ContextWindow int `json:"contextWindow,omitempty"`
 }
 
 // LLMService 由 internal/llm 实现（Eino 模型适配）。
@@ -246,6 +347,10 @@ type Policy struct {
 	MaxReqPerMin     int      `json:"maxReqPerMin"`
 	MaxToolCalls     int      `json:"maxToolCalls"`
 	MaxTokensPerRun  int      `json:"maxTokensPerRun"`
+	// AllowMethodControl 允许主控 Agent 通过 app.method 调节观澜自身
+	// （改值班调度、模型设置、盯盘规则、启停插件、导入知识库…）。
+	// 默认 true；它只放开"插件方法"，不放任意代码执行（那是 AllowExec）。
+	AllowMethodControl bool `json:"allowMethodControl"`
 }
 
 type Guard interface {

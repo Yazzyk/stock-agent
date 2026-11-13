@@ -101,99 +101,108 @@ func TestFixtureTHSKline(t *testing.T) {
 	}
 }
 
-// 东财板块资金流：diff[] 带 f12/f14/f62，且 f62 的单位是「元」。
-func TestFixtureEastmoneyBkzj(t *testing.T) {
+// 同花顺涨停池：status_code=0、data.date 是交易日、limit_up_count.today 汇总自洽。
+// 这条测试钉住「涨停数 / 炸板数 / 跌停数」三个口径的字段来源，
+// 它们是市场宽度里最容易读错的一列（open_num 是炸板数，不是跌停数）。
+func TestFixtureTHSLimitUpPool(t *testing.T) {
 	var payload struct {
-		RC   int `json:"rc"`
-		Data struct {
-			Total int `json:"total"`
-			Diff  []struct {
-				Code string  `json:"f12"`
-				Name string  `json:"f14"`
-				Main float64 `json:"f62"`
-			} `json:"diff"`
+		StatusCode int `json:"status_code"`
+		Data       struct {
+			Date string `json:"date"`
+			Info []struct {
+				Code       string  `json:"code"`
+				Name       string  `json:"name"`
+				Latest     float64 `json:"latest"`
+				ChangeRate float64 `json:"change_rate"`
+				HighDays   string  `json:"high_days"`
+				ReasonType string  `json:"reason_type"`
+				OpenNum    int     `json:"open_num"`
+			} `json:"info"`
+			LimitUpCount map[string]struct {
+				Num        int     `json:"num"`
+				HistoryNum int     `json:"history_num"`
+				Rate       float64 `json:"rate"`
+				OpenNum    int     `json:"open_num"`
+			} `json:"limit_up_count"`
+			LimitDownCount map[string]struct {
+				Num int `json:"num"`
+			} `json:"limit_down_count"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(loadFixture(t, "em_bkzj_industry.json"), &payload); err != nil {
-		t.Fatalf("板块资金流不是合法 JSON: %v", err)
+	if err := json.Unmarshal(loadFixture(t, "ths_limit_up_pool.json"), &payload); err != nil {
+		t.Fatalf("涨停池不是合法 JSON: %v", err)
 	}
-	if payload.RC != 0 {
-		t.Fatalf("rc 应为 0，实际 %d", payload.RC)
+	if payload.StatusCode != 0 {
+		t.Fatalf("status_code 应为 0，实际 %d", payload.StatusCode)
 	}
-	if payload.Data.Total < 50 || len(payload.Data.Diff) == 0 {
-		t.Fatalf("应返回足够多的板块：total=%d diff=%d", payload.Data.Total, len(payload.Data.Diff))
+	if len(payload.Data.Date) != 8 {
+		t.Fatalf("data.date 应是 8 位交易日（yyyyMMdd），实际 %q", payload.Data.Date)
 	}
-
-	var electronics *struct {
-		Code string  `json:"f12"`
-		Name string  `json:"f14"`
-		Main float64 `json:"f62"`
+	today, ok := payload.Data.LimitUpCount["today"]
+	if !ok {
+		t.Fatal("limit_up_count 必须带 today")
 	}
-	for i := range payload.Data.Diff {
-		item := &payload.Data.Diff[i]
-		if item.Code == "" || item.Name == "" {
-			t.Fatalf("第 %d 条缺少 code/name: %+v", i, item)
+	if today.Num <= 0 || today.HistoryNum < today.Num {
+		t.Fatalf("涨停数异常：num=%d history_num=%d（history_num 应 >= num，多出来的是炸板过的）", today.Num, today.HistoryNum)
+	}
+	if today.OpenNum < 0 || today.OpenNum > today.HistoryNum {
+		t.Fatalf("炸板数（open_num=%d）应在 [0, history_num] 之间", today.OpenNum)
+	}
+	if len(payload.Data.Info) != today.Num {
+		t.Fatalf("梯队行数 %d 应等于 today.num %d", len(payload.Data.Info), today.Num)
+	}
+	if _, ok := payload.Data.LimitDownCount["today"]; !ok {
+		t.Fatal("limit_down_count 必须带 today")
+	}
+	for i, row := range payload.Data.Info {
+		if len(row.Code) != 6 || row.Name == "" {
+			t.Fatalf("第 %d 行缺少 code/name: %+v", i, row)
 		}
-		// 只卡上限：小板块的净额本来就可能只有几十万（元）；
-		// 「单位是元而不是万元/亿元」由下面电子板块 ≈92 亿来钉死。
-		if abs := absFloat(item.Main); abs > 1e12 {
-			t.Fatalf("f62 量级异常（应为元，上限 1e12）：%s %s = %v", item.Code, item.Name, item.Main)
+		if row.Latest <= 0 {
+			t.Fatalf("第 %d 行现价非法: %+v", i, row)
 		}
-		if item.Name == "电子" {
-			electronics = item
+		// 涨停股涨幅应接近 10%（20cm 板是 20%，ST 是 5%），只卡下限兜住「字段读错」。
+		if row.ChangeRate < 4.5 {
+			t.Fatalf("第 %d 行涨跌幅 %.2f%% 明显不是涨停: %+v", i, row.ChangeRate, row)
 		}
-	}
-	if electronics == nil {
-		t.Fatal("夹具里应包含「电子」板块（青否抓取日排名变化则会失败，重抓夹具即可）")
-	}
-	yiYi := electronics.Main / 1e8
-	if yiYi < 90 || yiYi > 94 {
-		t.Fatalf("电子板块主力净额换算应为 92 亿量级（单位元），实际 %.2f 亿", yiYi)
+		if row.HighDays == "" {
+			t.Fatalf("第 %d 行缺 high_days（连板文案）: %+v", i, row)
+		}
 	}
 }
 
-// 东财个股资金流分档口径：f52 = f55 + f56，且 f53 + f54 = -f52。
-func TestFixtureEastmoneyFundFlowIdentity(t *testing.T) {
-	var payload struct {
-		Data struct {
-			Code   string   `json:"code"`
-			Name   string   `json:"name"`
-			Klines []string `json:"klines"`
-		} `json:"data"`
+// 新浪个股资金流：r0~r3 是「成交额（买+卖）」，净额必须自己用 in-out 算；
+// 同时钉住「主力 = 超大单 + 大单」这个与东财同名口径等价的算法。
+func TestFixtureSinaFundFlowNetIdentity(t *testing.T) {
+	var payload map[string]string
+	if err := json.Unmarshal(loadFixture(t, "sina_fund_flow_600000.json"), &payload); err != nil {
+		t.Fatalf("新浪个股资金流不是合法 JSON 对象: %v", err)
 	}
-	if err := json.Unmarshal(loadFixture(t, "em_fflow_600000.json"), &payload); err != nil {
-		t.Fatalf("个股资金流不是合法 JSON: %v", err)
-	}
-	if payload.Data.Code != "600000" || payload.Data.Name == "" {
-		t.Fatalf("data 应带 code/name，实际: %+v", payload.Data)
-	}
-	if len(payload.Data.Klines) == 0 {
-		t.Fatal("klines 不能为空")
-	}
-	fields := strings.Split(payload.Data.Klines[0], ",")
-	if len(fields) != 6 {
-		t.Fatalf("klines 每根应有 6 个字段（f51,f52,f53,f54,f55,f56），实际 %d: %v", len(fields), fields)
-	}
-	if !regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`).MatchString(fields[0]) {
-		t.Fatalf("f51 应是 YYYY-MM-DD 日期，实际 %q", fields[0])
-	}
-	vals := make([]float64, 5)
-	for i := range vals {
-		v, err := strconv.ParseFloat(fields[i+1], 64)
-		if err != nil {
-			t.Fatalf("第 %d 个资金字段不是数字: %q", i+1, fields[i+1])
+	for _, key := range []string{"r0_in", "r0_out", "r1_in", "r1_out", "netamount", "name", "trade"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("缺少字段 %s", key)
 		}
-		vals[i] = v
 	}
-	main, small, medium, large, super := vals[0], vals[1], vals[2], vals[3], vals[4]
-
-	// 主力 = 大单 + 超大单（DOMAIN 2.1）
-	if diff := main - (large + super); diff > 1e-6 || diff < -1e-6 {
-		t.Fatalf("主力净额应等于大单+超大单：f52=%.2f f55+f56=%.2f", main, large+super)
+	num := func(key string) float64 {
+		v, err := strconv.ParseFloat(payload[key], 64)
+		if err != nil {
+			t.Fatalf("字段 %s 不是数字: %q", key, payload[key])
+		}
+		return v
 	}
-	// 四档净额相消（净流入总量为 0，浮点/取整允许几元误差）
-	if sum := small + medium + large + super; sum > 10 || sum < -10 {
-		t.Fatalf("四档净额之和应≈0（互相抵消），实际 %.2f（小%.0f 中%.0f 大%.0f 超大%.0f）", sum, small, medium, large, super)
+	superNet := num("r0_in") - num("r0_out")
+	largeNet := num("r1_in") - num("r1_out")
+	if superNet == 0 && largeNet == 0 {
+		t.Fatal("超大单与大单净额同时为 0，夹具或口径有问题")
+	}
+	// netamount 是四档净额之和，用来交叉校验「in-out 才是净额」这个口径。
+	mediumNet := num("r2_in") - num("r2_out")
+	smallNet := num("r3_in") - num("r3_out")
+	if sum := superNet + largeNet + mediumNet + smallNet; absFloat(sum-num("netamount")) > 1 {
+		t.Fatalf("四档净额之和 %.2f 应等于 netamount %.2f", sum, num("netamount"))
+	}
+	if num("trade") <= 0 {
+		t.Fatalf("trade 应大于 0，实际 %v", num("trade"))
 	}
 }
 

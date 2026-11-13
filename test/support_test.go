@@ -86,7 +86,7 @@ func newFakeGuard(roots ...string) *fakeGuard {
 		roots = []string{filepath.Join(string(filepath.Separator), "tmp", "guanlan-test")}
 	}
 	return &fakeGuard{policy: contract.Policy{
-		NetworkAllowlist: []string{"eastmoney.com", "10jqka.com.cn", "gtimg.cn", "sinajs.cn"},
+		NetworkAllowlist: []string{"10jqka.com.cn", "gtimg.cn", "sinajs.cn", "sina.com.cn"},
 		PathRoots:        roots,
 		AllowExec:        false,
 		MaxReqPerMin:     60,
@@ -138,7 +138,9 @@ func (g *fakeGuard) CheckPath(p string) error {
 
 type pathDeniedError struct{ path string }
 
-func (e *pathDeniedError) Error() string { return "安全策略：路径不在允许目录内: " + e.path }
+func (e *pathDeniedError) Error() string {
+	return "安全策略：路径不在允许目录内: " + e.path
+}
 
 var redactPatterns = []string{"sk-", "Bearer ", "token=", "cookie=", "password=", "api_key="}
 
@@ -377,12 +379,12 @@ func newKernelWithData(t *testing.T, data contract.DataService) *kernelFixture {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	k, err := kernel.New(kernel.Options{
-		Logger: logger,
-		Store:  store,
-		Data:   data,
-		Guard:  guard,
-		Audit:  audit,
-		Clock:  time.Now,
+		Logger:  logger,
+		Store:   store,
+		Data:    data,
+		Guard:   guard,
+		Audit:   audit,
+		Clock:   time.Now,
 		DataDir: dir,
 	})
 	if err != nil {

@@ -57,8 +57,8 @@ func (fakeData) Bars(_ context.Context, code string, _ contract.Period, limit in
 	for i := 0; i < limit; i++ {
 		price += 0.02 * math.Sin(float64(i)*0.3)
 		out[i] = contract.Bar{
-			Date:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i).Format("2006-01-02"),
-			Open:   price, High: price * 1.01, Low: price * 0.99, Close: price,
+			Date: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i).Format("2006-01-02"),
+			Open: price, High: price * 1.01, Low: price * 0.99, Close: price,
 			Volume: 500000 + float64(i%7)*1000, Amount: price * (500000 + float64(i%7)*1000),
 		}
 	}
@@ -474,17 +474,17 @@ func TestWatchHotReloadRuleFile(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	engine, err := watch.New(watch.Options{
-		Store:     newFakeStore(),
-		Data:      fakeData{},
-		Guard:     newFakeGuard(),
-		Audit:     newFakeAudit(),
-		Events:    plugin.NewBus(),
-		Clock:     time.Now,
-		Logger:    discardLogger(),
-		DataDir:   dir,
-		Tick:      100 * time.Millisecond,
+		Store:       newFakeStore(),
+		Data:        fakeData{},
+		Guard:       newFakeGuard(),
+		Audit:       newFakeAudit(),
+		Events:      plugin.NewBus(),
+		Clock:       time.Now,
+		Logger:      discardLogger(),
+		DataDir:     dir,
+		Tick:        100 * time.Millisecond,
 		TradingOnly: false,
-		Trigger:   func(context.Context, string, string) (string, error) { return "", nil },
+		Trigger:     func(context.Context, string, string) (string, error) { return "", nil },
 	})
 	if err != nil {
 		t.Fatalf("engine.New 失败: %v", err)
@@ -540,7 +540,6 @@ func TestWatchHotReloadRuleFile(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
-
 
 // 默认关闭的规则在 tick 里必须被跳过；显式开启后才允许触发（会真的花模型 token）。
 func TestWatchDisabledRuleDoesNotTrigger(t *testing.T) {

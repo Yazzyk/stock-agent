@@ -32,8 +32,8 @@ func (fakeData) Bars(_ context.Context, code string, _ contract.Period, limit in
 			price -= 0.2
 		}
 		bars = append(bars, contract.Bar{
-			Date:   "2026-01-" + pad2(i%28+1),
-			Open:   price * 0.999, High: price * 1.01, Low: price * 0.99, Close: price, Volume: 10000,
+			Date: "2026-01-" + pad2(i%28+1),
+			Open: price * 0.999, High: price * 1.01, Low: price * 0.99, Close: price, Volume: 10000,
 		})
 	}
 	return bars, nil
@@ -41,9 +41,11 @@ func (fakeData) Bars(_ context.Context, code string, _ contract.Period, limit in
 func (fakeData) StockFundFlow(context.Context, string) (contract.FundFlow, error) {
 	return contract.FundFlow{}, nil
 }
-func (fakeData) FundFlowRank(context.Context, string, int) ([]contract.FundFlow, error) { return nil, nil }
-func (fakeData) Sectors(context.Context, string) ([]contract.Sector, error)            { return nil, nil }
-func (fakeData) Watchlist(context.Context) ([]contract.WatchItem, error)                { return nil, nil }
+func (fakeData) FundFlowRank(context.Context, string, int) ([]contract.FundFlow, error) {
+	return nil, nil
+}
+func (fakeData) Sectors(context.Context, string) ([]contract.Sector, error) { return nil, nil }
+func (fakeData) Watchlist(context.Context) ([]contract.WatchItem, error)    { return nil, nil }
 func (fakeData) SyncTHSWatchlist(context.Context) (contract.SyncResult, error) {
 	return contract.SyncResult{}, nil
 }
@@ -62,11 +64,11 @@ type memStore struct {
 	data map[string]map[string][]byte
 }
 
-func (s *memStore) Get(bucket, key string) ([]byte, error) { return nil, contract.ErrNotFound }
-func (s *memStore) Put(bucket, key string, val []byte) error { return nil }
-func (s *memStore) Delete(bucket, key string) error          { return nil }
+func (s *memStore) Get(bucket, key string) ([]byte, error)                { return nil, contract.ErrNotFound }
+func (s *memStore) Put(bucket, key string, val []byte) error              { return nil }
+func (s *memStore) Delete(bucket, key string) error                       { return nil }
 func (s *memStore) List(bucket, prefix string) ([]contract.KVItem, error) { return nil, nil }
-func (s *memStore) Close() error                                         { return nil }
+func (s *memStore) Close() error                                          { return nil }
 
 type okGuard struct{}
 
@@ -77,8 +79,8 @@ func (okGuard) Policy() contract.Policy { return contract.Policy{AllowExec: fals
 
 type noAudit struct{}
 
-func (noAudit) Record(contract.AuditEvent)                  {}
-func (noAudit) List(int) ([]contract.AuditEvent, error)      { return nil, nil }
+func (noAudit) Record(contract.AuditEvent)              {}
+func (noAudit) List(int) ([]contract.AuditEvent, error) { return nil, nil }
 
 func newKernel(t *testing.T) *kernel.Kernel {
 	t.Helper()
@@ -115,7 +117,7 @@ func TestPluginExposesUIToolAndService(t *testing.T) {
 	if len(pv.UI) != 1 || pv.UI[0].Component != "quant" || pv.UI[0].Order != 45 {
 		t.Fatalf("面板声明不符: %+v", pv.UI)
 	}
-	if len(pv.Tools) != 1 || pv.Tools[0].Name != "quant.backtest" {
+	if len(pv.Tools) != 2 || pv.Tools[0].Name != "quant.backtest" || pv.Tools[1].Name != "quant.optimize" {
 		t.Fatalf("工具声明不符: %+v", pv.Tools)
 	}
 	if _, ok := k.Services().Get("quant.engine"); !ok {
@@ -154,8 +156,10 @@ func TestStrategiesAndWalkForward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("strategies 失败: %v", err)
 	}
-	if !strings.Contains(string(out), "均线交叉") {
-		t.Fatalf("策略清单不符: %s", out)
+	for _, key := range []string{"均线交叉", "formula", "rules", "T+1", "佣金", "复权", "costs"} {
+		if !strings.Contains(string(out), key) {
+			t.Fatalf("策略清单缺少 %q: %s", key, out)
+		}
 	}
 	out, err = k.Invoke(context.Background(), "quant", "walkforward", json.RawMessage(`{"code":"600000","strategy":"ma","folds":3}`))
 	if err != nil {
@@ -179,5 +183,107 @@ func TestToolToleratesEmptyArgsAndUnknownStrategy(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "买入持有") {
 		t.Fatalf("回落策略不符: %s", out)
+	}
+}
+
+// TestRunReturnsPerFillTrades 覆盖契约 §3.7.1：
+// 顶层 trades 是逐笔成交（可画买卖点），result.trades 仍是往返交易，两不相扰。
+func TestRunReturnsPerFillTrades(t *testing.T) {
+	k := newKernel(t)
+	out, err := k.Invoke(context.Background(), "quant", "run", json.RawMessage(`{"code":"600000","strategy":"ma","params":{"fast":3,"slow":8}}`))
+	if err != nil {
+		t.Fatalf("调用失败: %v", err)
+	}
+	var payload struct {
+		Trades []struct {
+			Date   string  `json:"date"`
+			Side   string  `json:"side"`
+			Price  float64 `json:"price"`
+			Qty    int     `json:"qty"`
+			Reason string  `json:"reason"`
+		} `json:"trades"`
+		Result struct {
+			Fills  []map[string]any `json:"fills"`
+			Trades []map[string]any `json:"trades"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("返回不是 JSON: %s", out)
+	}
+	if len(payload.Trades) == 0 {
+		t.Fatalf("顶层 trades 为空（回测应至少产生一次成交）: %s", out)
+	}
+	for _, fill := range payload.Trades {
+		if fill.Side != "buy" && fill.Side != "sell" {
+			t.Fatalf("side 非法: %+v", fill)
+		}
+		if fill.Date == "" || fill.Price <= 0 || fill.Qty <= 0 {
+			t.Fatalf("成交字段不完整: %+v", fill)
+		}
+	}
+	if len(payload.Result.Fills) != len(payload.Trades) {
+		t.Fatalf("result.fills 与顶层 trades 应是同一份数据: %d vs %d", len(payload.Result.Fills), len(payload.Trades))
+	}
+	if len(payload.Result.Trades) == 0 {
+		t.Fatal("result.trades（往返交易）不应为空")
+	}
+	if _, ok := payload.Result.Trades[0]["entryDate"]; !ok {
+		t.Fatalf("result.trades 的往返语义被改了: %v", payload.Result.Trades[0])
+	}
+}
+
+// TestOptimizeMethodAndTool 覆盖参数优化方法/工具：候选非空、报告含稳健性与样本外、不返回净值序列。
+func TestOptimizeMethodAndTool(t *testing.T) {
+	k := newKernel(t)
+	out, err := k.Invoke(context.Background(), "quant", "optimize", json.RawMessage(`{"code":"600000","strategy":"ma","folds":3}`))
+	if err != nil {
+		t.Fatalf("optimize 失败: %v", err)
+	}
+	var payload struct {
+		Result struct {
+			Candidates []struct {
+				Params    map[string]any `json:"params"`
+				Stability float64        `json:"stability"`
+			} `json:"candidates"`
+			Best        map[string]any `json:"best"`
+			WalkForward struct {
+				Verdict string `json:"verdict"`
+			} `json:"walkforward"`
+			Report string `json:"report"`
+			Note   string `json:"note"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("返回不是 JSON: %s", out)
+	}
+	if len(payload.Result.Candidates) == 0 {
+		t.Fatalf("候选为空: %s", out)
+	}
+	if payload.Result.Best == nil {
+		t.Fatalf("缺少推荐参数: %s", out)
+	}
+	for _, c := range payload.Result.Candidates {
+		if c.Stability < 0 || c.Stability > 1 {
+			t.Fatalf("稳健性越界: %+v", c)
+		}
+	}
+	if payload.Result.WalkForward.Verdict == "" {
+		t.Fatalf("缺少 walk-forward 结论: %s", out)
+	}
+	for _, key := range []string{"推荐参数", "邻域稳健性", "Walk-forward", "警告"} {
+		if !strings.Contains(payload.Result.Report, key) {
+			t.Fatalf("报告缺少 %q", key)
+		}
+	}
+	if strings.Contains(string(out), "equity") {
+		t.Fatalf("参数优化不应返回净值序列: %s", out)
+	}
+
+	out, err = k.CallTool(context.Background(), "quant.optimize", json.RawMessage(`{"code":"600000","strategy":"rsi","folds":2,"limit":200}`))
+	if err != nil {
+		t.Fatalf("quant.optimize 工具失败: %v", err)
+	}
+	if !strings.Contains(string(out), "report") || !strings.Contains(string(out), "candidates") {
+		t.Fatalf("工具返回缺少摘要或报告: %s", out)
 	}
 }

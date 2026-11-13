@@ -1,0 +1,14 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-auction",
+  "data": {
+    "timestamp": 1794552951578,
+    "auction_phase": "closed",
+    "data_status": "final",
+    "total": 1,
+    "item": [
+      {"thscode":"600519.SH","ticker":"600519","name":"贵州茅台","auction_price":1421.0,"auction_pct":0.35,"auction_volume":12600,"auction_amount":17904600,"auction_unmatched":800,"auction_turnover_pct":0.01,"auction_yesterday_ratio_pct":82.4,"auction_volume_ratio":1.12,"pre_close_price":1416.04,"open_price":1421.0,"last_price":1421.0,"float_market_cap":1785000000000}
+    ]
+  }
+}

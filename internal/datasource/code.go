@@ -32,8 +32,10 @@ var (
 	errEmptyCode  = errors.New("datasource: 代码不能为空")
 	errBadCode    = errors.New("datasource: 无法识别的代码")
 	digitSymbolRe = regexp.MustCompile(`^\d{6}$`)
-	bkSymbolRe    = regexp.MustCompile(`(?i)^bk\d{4}$`)
-	thsAlphaRe    = regexp.MustCompile(`(?i)^[0-9][a-z][0-9]{4}$`)
+	// bkSymbolRe 只用于识别「旧东财板块代码」这类已下线的写法，命中时给可操作的中文错误，
+	// 而不是当成合法标的放行（数据层已经没有东财板块接口了）。
+	bkSymbolRe = regexp.MustCompile(`(?i)^bk\d{1,6}$`)
+	thsAlphaRe = regexp.MustCompile(`(?i)^[0-9][a-z][0-9]{4}$`)
 	// 同花顺板块/概念指数：881xxx（行业）、883/884/885xxx（概念系列）
 	thsSectorRe = regexp.MustCompile(`^88[1-5]\d{3}$`)
 )
@@ -53,8 +55,10 @@ var thsIndexSymbols = map[string]string{
 //	600000 / sh600000 / SH600000 / 1.600000 / s_sh600000 → 沪市个股
 //	000001 → 深市个股（平安银行；指数必须写 sh000001，避免歧义）
 //	sh000001 / 1A0001 → 上证指数
-//	BK1036 / 90.BK1036 → 东财板块
-//	bk_881101 / 881101 → 同花顺板块
+//	bk_881101 / 881101 → 同花顺板块指数
+//
+// 板块/概念本身用新浪 category（new_dzxx / gn_hwqc）标识，不走 ParseCode —— 它是字符串标识
+// 而不是代码，入口在 normalizeSectorCategory。
 func ParseCode(raw string) (Code, error) {
 	text := strings.ToLower(strings.TrimSpace(raw))
 	text = strings.ReplaceAll(text, " ", "")
@@ -73,7 +77,7 @@ func ParseCode(raw string) (Code, error) {
 		return parseTHSSector(raw, strings.TrimPrefix(text, "bk_"))
 	}
 
-	// 东财 secid：1.600000 / 0.000001 / 90.BK1036
+	// 旧 secid 写法：1.600000 / 0.000001（仍接受，只是不再有 90.BKxxxx 这种板块 secid）
 	if idx := strings.Index(text, "."); idx > 0 {
 		head, tail := text[:idx], text[idx+1:]
 		switch head {
@@ -82,7 +86,8 @@ func ParseCode(raw string) (Code, error) {
 		case "0":
 			return finalize(raw, tail, contract.MarketSZ)
 		case "90":
-			return parseEMSector(raw, tail)
+			// 90.BKxxxx 是旧东财板块 secid，本层已经没有板块 secid 概念。
+			return Code{}, fmt.Errorf("%w: %s（板块代码已切换为新浪口径，如 new_dzxx，请用 sector.list 选择）", errBadCode, raw)
 		}
 	}
 
@@ -96,9 +101,9 @@ func ParseCode(raw string) (Code, error) {
 		}
 	}
 
-	// 无前缀的板块写法
+	// 无前缀的同花顺板块写法；旧 BK 代码直接给出可操作的中文错误。
 	if bkSymbolRe.MatchString(text) {
-		return parseEMSector(raw, text)
+		return Code{}, fmt.Errorf("%w: %s（板块代码已切换为新浪口径，如 new_dzxx，请用 sector.list 选择）", errBadCode, raw)
 	}
 	if thsSectorRe.MatchString(text) {
 		return parseTHSSector(raw, text)
@@ -140,15 +145,6 @@ func parseTHSSector(raw, body string) (Code, error) {
 		}
 	}
 	return Code{Raw: raw, Symbol: body, Kind: KindSector}, nil
-}
-
-// parseEMSector 处理 BK1036 与 90.BK1036。
-func parseEMSector(raw, body string) (Code, error) {
-	upper := strings.ToUpper(strings.TrimSpace(body))
-	if !bkSymbolRe.MatchString(upper) {
-		return Code{}, fmt.Errorf("%w: %s", errBadCode, raw)
-	}
-	return Code{Raw: raw, Symbol: upper, Kind: KindSector}, nil
 }
 
 // finalize 在已知/可推断市场的前提下判定个股或指数。
@@ -237,24 +233,6 @@ func (c Code) THSSymbol() string {
 		}
 		return "hs_" + c.Symbol
 	}
-}
-
-// SecID 返回东财 secid（1.600000 / 0.000001 / 90.BK1036）；不支持时返回空串。
-func (c Code) SecID() string {
-	switch c.Kind {
-	case KindSector, KindConcept:
-		if bkSymbolRe.MatchString(c.Symbol) {
-			return "90." + c.Symbol
-		}
-		return ""
-	}
-	switch c.Market {
-	case contract.MarketSH:
-		return "1." + c.Symbol
-	case contract.MarketSZ, contract.MarketBJ:
-		return "0." + c.Symbol
-	}
-	return ""
 }
 
 // MarketSymbol 返回腾讯/新浪使用的 symbol（sh600000 / sz000001 / bj430047）。

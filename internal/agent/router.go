@@ -71,45 +71,35 @@ var routeRules = []struct {
 	{WorkerIntraday, []string{"盯盘", "监控", "异动", "提醒", "现在", "盘中", "拉升", "跳水"}},
 }
 
-// Plan 产出路由结论。重复触发不报错，而是标记 Deduped 让上层回放上次结论；
+// Plan 产出路由结论。空 worker 与 router 都进入总控（默认对话入口）：
+// 总控自己决定直接回答、派生 worker 还是创建新 worker，因此不做关键词分派、去重与限频。
+// 显式 worker 仍按别名归一化；worker="auto" 保留旧的关键词/模型判意图快慢双路径。
+// 重复触发不报错，而是标记 Deduped 让上层回放上次结论；
 // 触发过频返回错误，避免模型被循环调用烧钱。
 func (r *Router) Plan(ctx context.Context, in RouteInput) (RouteDecision, error) {
 	decision := RouteDecision{Phase: TradingPhase(r.clock())}
 	raw := strings.TrimSpace(in.Worker)
 	input := strings.TrimSpace(in.Input)
 
-	if raw != "" {
+	switch {
+	case raw == "" || NormalizeWorker(raw) == WorkerRouter:
+		decision.Worker = WorkerRouter
+		decision.Fast = true
+		decision.Note = "默认 RouterAgent"
+	case strings.EqualFold(raw, "auto"):
+		decision = r.planAuto(ctx, decision, input)
+	default:
 		decision.Worker = NormalizeWorker(raw)
 		decision.Fast = true
 		if !isKnownWorkerAlias(raw) {
 			decision.Note = fmt.Sprintf("未识别的 worker %q，已回落到 %s", raw, decision.Worker)
 		}
-	} else if ruleWorker, ok := matchRules(input); ok {
-		decision.Worker = ruleWorker
-		decision.Fast = true
-		decision.Note = "规则命中"
-	} else if r.llm != nil {
-		// Slow Path：让轻量模型判意图；失败回落到关键词/闲聊。
-		worker, intent, err := r.classify(ctx, input)
-		if err == nil {
-			decision.Worker = worker
-			decision.Intent = intent
-			decision.Note = "模型判意图"
-		} else if ruleWorker, ok := matchRules(input); ok {
-			decision.Worker = ruleWorker
-			decision.Fast = true
-			decision.Note = "模型判意图失败，回落到规则"
-		} else {
-			decision.Worker = WorkerChat
-			decision.Fast = true
-			decision.Note = "模型判意图失败，回落到聊天"
-		}
-	} else {
-		decision.Worker = WorkerChat
-		decision.Fast = true
 	}
 	if decision.Intent == "" {
 		decision.Intent = truncateRunes(input, 40)
+	}
+	if decision.Worker == WorkerRouter {
+		return decision, nil
 	}
 
 	now := r.clock()
@@ -127,6 +117,38 @@ func (r *Router) Plan(ctx context.Context, in RouteInput) (RouteDecision, error)
 	r.last[key] = now
 	r.runs[string(decision.Worker)] = append(r.runs[string(decision.Worker)], now)
 	return decision, nil
+}
+
+// planAuto 是兼容旧行为的自动分派：先关键词规则，再让轻量模型判意图，最后回落 chat。
+func (r *Router) planAuto(ctx context.Context, decision RouteDecision, input string) RouteDecision {
+	if ruleWorker, ok := matchRules(input); ok {
+		decision.Worker = ruleWorker
+		decision.Fast = true
+		decision.Note = "规则命中"
+		return decision
+	}
+	if r.llm == nil {
+		decision.Worker = WorkerChat
+		decision.Fast = true
+		return decision
+	}
+	worker, intent, err := r.classify(ctx, input)
+	if err == nil {
+		decision.Worker = worker
+		decision.Intent = intent
+		decision.Note = "模型判意图"
+		return decision
+	}
+	if ruleWorker, ok := matchRules(input); ok {
+		decision.Worker = ruleWorker
+		decision.Fast = true
+		decision.Note = "模型判意图失败，回落到规则"
+		return decision
+	}
+	decision.Worker = WorkerChat
+	decision.Fast = true
+	decision.Note = "模型判意图失败，回落到聊天"
+	return decision
 }
 
 func (r *Router) pruneLocked(now time.Time) {
@@ -184,7 +206,12 @@ func matchRules(input string) (WorkerID, bool) {
 }
 
 func isKnownWorkerAlias(raw string) bool {
+	if strings.EqualFold(strings.TrimSpace(raw), "auto") {
+		return true
+	}
 	switch NormalizeWorker(raw) {
+	case WorkerRouter:
+		return containsAny(raw, "router", "orchestrator", "dispatch", "main", "总控")
 	case WorkerPremarket:
 		return containsAny(raw, "premarket", "plan", "pre", "morning")
 	case WorkerIntraday:

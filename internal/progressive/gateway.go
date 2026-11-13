@@ -96,6 +96,33 @@ type CallResult struct {
 	Result    json.RawMessage `json:"result"`
 }
 
+// ToolIndexEntry 是 L1 工具索引的只读视图：只有名称/摘要/标签/风险，不含 schema。
+type ToolIndexEntry struct {
+	Name    string
+	Summary string
+	Tags    []string
+	Risk    string
+}
+
+// ToolIndex 返回当前 L1 工具索引快照（已按网关规则排除元工具自身），
+// 供上下文用量估算算 toolsTokens——只算"名称+摘要+标签"，不把 schema 算进去（渐进披露）。
+func (g *Gateway) ToolIndex() []ToolIndexEntry {
+	if g == nil {
+		return nil
+	}
+	tools := g.toolList()
+	out := make([]ToolIndexEntry, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, ToolIndexEntry{
+			Name:    t.Name,
+			Summary: TruncateRunes(strings.TrimSpace(t.Summary), SummaryMaxRunes),
+			Tags:    append([]string{}, t.Tags...),
+			Risk:    string(t.Risk),
+		})
+	}
+	return out
+}
+
 // Search 在工具索引里按关键词检索（L1→定位）。打分规则可复现：
 // 名称完全相等 6 分、名称包含 4 分、标签命中 3 分、摘要命中 2 分、名称分词命中 1 分；同分按名称排序。
 func (g *Gateway) Search(query string, limit int) (SearchResult, error) {

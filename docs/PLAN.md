@@ -44,11 +44,13 @@
 
 ## 4. 数据源事实（已实测，2026-11-10）
 
+> **现状（2026-11-12）：数据层已彻底移除东方财富。本表里的 eastmoney 端点全部是「历史方案，已下线，勿再接入」——网络白名单也已删除 eastmoney.com，重新接回会同时违反安全策略。** 现在只连三家：同花顺 `10jqka.com.cn`、腾讯 `gtimg.cn`、新浪 `sinajs.cn` / `sina.com.cn`。下表中同花顺 / 腾讯 / 新浪的端点仍然有效，东财三行只作追溯。
+
 | 用途 | 可用端点 | 备注 |
 |---|---|---|
-| 个股/指数 K 线 | `https://push2.eastmoney.com/api/qt/stock/kline/get`（https 可用，http 502） | `secid=1.600000/0.000001`，`klt=101/102/103`，`fqt=0/1/2` |
-| 个股资金流 | `https://push2.eastmoney.com/api/qt/stock/fflow/kline/get` | f51 日期、f52 主力、f53 小单、f54 中单、f55 大单、f56 超大单 |
-| 板块/概念资金流排名 | `https://data.eastmoney.com/dataapi/bkzj/getbkzj?key=f62&code=m:90+t:2`（行业 t:2 / 概念 t:3） | 返回 diff[].f12/f14/f62 |
+| 个股/指数 K 线 | ~~`https://push2.eastmoney.com/api/qt/stock/kline/get`~~（历史方案，已下线，勿再接入） | 现由腾讯 `fqkline`（`qfqday`/`hfqday`）与同花顺 line 承担 |
+| 个股资金流 | ~~`https://push2.eastmoney.com/api/qt/stock/fflow/kline/get`~~（历史方案，已下线，勿再接入） | 现由新浪 `MoneyFlow` 承担：`r0~r3` 成交额、净额 = in − out、主力 = `r0_net + r1_net` |
+| 板块/概念资金流排名 | ~~`https://data.eastmoney.com/dataapi/bkzj/getbkzj`~~（历史方案，已下线，勿再接入） | 现由新浪 `MoneyFlow.ssl_bkzj_bk` 承担，板块代码是新浪 category（如 `new_dzxx`），不是 `BK` 代码 |
 | 快照（JSONP） | `https://d.10jqka.com.cn/v6/realhead/hs_<code>/defer/last.js` | items.10=现价；其余字段需和腾讯/新浪交叉校验后再用 |
 | K 线（THS，含板块 bk_） | `https://d.10jqka.com.cn/v6/line/hs_<code>/01/last.js` | 全量历史 |
 | 快照兜底 | `https://qt.gtimg.cn/q=sh600000`、`https://hq.sinajs.cn/list=sh600000` | GBK，需 x/text 转码 |

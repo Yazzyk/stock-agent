@@ -106,54 +106,54 @@ check_ths_kline() {
   pass "$name" "${size}B，JSONP + data/total 正常"
 }
 
-# ---------- 2. 东财板块资金流排名（bkzj） ----------
-check_eastmoney_bkzj() {
-  local name='东财 bkzj 板块资金'
-  local url='https://data.eastmoney.com/dataapi/bkzj/getbkzj?key=f62&code=m:90+t:2'
+# ---------- 2. 新浪板块资金流排名（ssl_bkzj_bk） ----------
+check_sina_bkzj_rank() {
+  local name='新浪板块资金榜'
+  local url='https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_bkzj_bk?page=1&num=100&sort=netamount&asc=0&fenlei=0'
   should_run "$name" || return 0
   request "$url"
   local body="$RESP_BODY" size
   if [ "$RESP_CODE" -ne 0 ]; then
-    warn "$name" "请求失败（curl 退出码 ${RESP_CODE}，超时 ${TIMEOUT}s）"
+    warn "$name" "请求失败（curl 退出码 $RESP_CODE，超时 $TIMEOUT 秒）"
     return 0
   fi
   size="$(bytes "$body")"
-  if ! contains "$body" '"diff"'; then
-    warn "$name" "缺少 diff 列表（${size}B）"
+  if ! contains "$body" '"category"'; then
+    warn "$name" "缺少 category（新浪板块代码，$size 字节）"
     return 0
   fi
-  if ! contains "$body" '"f62"'; then
-    warn "$name" "缺少字段 f62（主力净额）"
+  if ! contains "$body" '"netamount"'; then
+    warn "$name" "缺少 netamount（资金净额）"
     return 0
   fi
-  if ! contains "$body" '"f14"'; then
-    warn "$name" "缺少字段 f14（板块名称）"
-    return 0
-  fi
-  pass "$name" "${size}B，diff/f62/f14 正常"
+  pass "$name" "$size 字节，category/netamount 正常"
 }
 
-# ---------- 3. 东财个股资金流（push2 fflow） ----------
-check_push2_fflow() {
-  local name='push2 fflow 个股资金'
-  local url='https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=1.600000&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56&klt=101&lmt=10'
+# ---------- 3. 新浪个股多日资金流（ssl_qsfx_zjlrqs） ----------
+check_sina_flow_history() {
+  local name='新浪多日资金流'
+  local url='https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=20&sort=opendate&asc=0&daima=sh600000'
   should_run "$name" || return 0
   request "$url"
   local body="$RESP_BODY" size
   if [ "$RESP_CODE" -ne 0 ]; then
-    warn "$name" "请求失败（curl 退出码 ${RESP_CODE}，超时 ${TIMEOUT}s）"
+    warn "$name" "请求失败（curl 退出码 $RESP_CODE，超时 $TIMEOUT 秒）"
     return 0
   fi
   size="$(bytes "$body")"
-  if contains "$body" '"data":null'; then
-    warn "$name" "返回 data=null（secid 或参数可能变了）"
+  if [ "$body" = "null" ] || [ -z "$body" ]; then
+    warn "$name" "返回 null/空（代码或参数可能变了）"
     return 0
   fi
-  if ! contains "$body" '"klines"'; then
-    warn "$name" "缺少 klines 字段（${size}B）"
+  if ! contains "$body" '"opendate"'; then
+    warn "$name" "缺少 opendate（$size 字节）"
     return 0
   fi
-  pass "$name" "${size}B，data.klines 正常"
+  if ! contains "$body" '"r0_net"'; then
+    warn "$name" "缺少 r0_net（超大单净额）"
+    return 0
+  fi
+  pass "$name" "$size 字节，opendate/r0_net 正常"
 }
 
 # ---------- 4. 新浪个股资金流（兜底） ----------
@@ -204,39 +204,97 @@ check_tencent_snapshot() {
   pass "$name" "${size}B，${tilde} 个字段分隔符"
 }
 
-# ---------- 附加：东财 K 线（push2his / push2 两个主机都试） ----------
-check_eastmoney_kline() {
-  local name='东财 K线 https'
+# ---------- 附加：腾讯 K 线后复权（hfq，替换旧东财 K 线检查） ----------
+check_tencent_hfq() {
+  local name='腾讯 hfq 后复权'
+  local url='https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,,,30,hfq'
   should_run "$name" || return 0
-  local query='secid=1.600000&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&lmt=5'
-  local hosts='https://push2his.eastmoney.com/api/qt/stock/kline/get https://push2.eastmoney.com/api/qt/stock/kline/get'
-  local tries="" host
-  for host in $hosts; do
-    request "${host}?${query}"
-    if [ "$RESP_CODE" -ne 0 ]; then
-      tries="${tries}${host} curl=${RESP_CODE}; "
-      continue
+  request "$url"
+  local body="$RESP_BODY" size
+  if [ "$RESP_CODE" -ne 0 ]; then
+    warn "$name" "请求失败（curl 退出码 $RESP_CODE，超时 $TIMEOUT 秒）"
+    return 0
+  fi
+  size="$(bytes "$body")"
+  if ! contains "$body" '"hfqday"'; then
+    warn "$name" "缺少 hfqday 键（$size 字节，后复权可能已下线）"
+    return 0
+  fi
+  pass "$name" "$size 字节，data 下 hfqday 正常"
+}
+
+# ---------- 附加：同花顺涨停池（limit_up_pool） ----------
+check_ths_limit_up() {
+  local name='同花顺涨停池'
+  # data.10jqka.com.cn 必须带浏览器 UA + 同域 Referer，否则被 Nginx 403
+  local url='https://data.10jqka.com.cn/dataapi/limit_up/limit_up_pool?page=1&limit=200&field=10,9001,9002,330323,330324,330325,330329,199112,133971,133970,1968584&filter=HS,GEM2STAR&order_field=330324&order_type=0'
+  should_run "$name" || return 0
+  request "$url" 'https://data.10jqka.com.cn/market/longhu/'
+  local body="$RESP_BODY" size
+  if [ "$RESP_CODE" -ne 0 ]; then
+    warn "$name" "请求失败（curl 退出码 $RESP_CODE，超时 $TIMEOUT 秒）"
+    return 0
+  fi
+  size="$(bytes "$body")"
+  if ! contains "$body" '"limit_up_count"'; then
+    warn "$name" "缺少 limit_up_count 汇总（$size 字节）"
+    return 0
+  fi
+  if ! contains "$body" '"open_num"'; then
+    warn "$name" "缺少 open_num（炸板数口径）"
+    return 0
+  fi
+  pass "$name" "$size 字节，limit_up_count/open_num 正常"
+}
+
+# ---------- 附加：同花顺龙虎榜（GBK HTML 表格） ----------
+# 龙虎榜只在收盘后才发布，直接查「今天」在盘中必然是空表（0 字节）。
+# 产品代码 fetchMarketLongHu 会自己往前回退到最近有数据的交易日，
+# 所以这里也必须**沿着同一条回退路径**验证，否则冒烟测的是「今天有没有收盘」
+# 而不是「端点还能不能解析」。回退窗口与产品一致：最多 5 个自然日内的工作日。
+check_ths_longhu() {
+  local name='同花顺龙虎榜'
+  local offset day url body size rows tried=0
+  should_run "$name" || return 0
+  for offset in 0 1 2 3 4 5 6; do
+    if [ "$tried" -ge 5 ]; then
+      break
     fi
-    local body="$RESP_BODY" size
-    size="$(bytes "$body")"
-    if contains "$body" '"klines"'; then
-      pass "$name" "${host} ${size}B，data.klines 正常"
+    day="$(date -v-${offset}d '+%Y-%m-%d' 2>/dev/null || date -d "-${offset} day" '+%Y-%m-%d')"
+    url="https://data.10jqka.com.cn/ifmarket/lhbtable/report/$day/1"
+    request "$url" 'https://data.10jqka.com.cn/market/longhu/'
+    if [ "$RESP_CODE" -ne 0 ]; then
+      warn "$name" "请求失败（curl 退出码 $RESP_CODE，超时 $TIMEOUT 秒）"
       return 0
     fi
-    tries="${tries}${host} 无 klines(${size}B); "
+    body="$RESP_BODY"
+    size="$(bytes "$body")"
+    # 表格是 GBK，中文在 UTF-8 下不可读；只断言结构：m-table 与 tr 行数。
+    # 空表（当日未发布/非交易日）继续往前找，不算失败。
+    if contains "$body" 'm-table'; then
+      rows="$(printf '%s' "$body" | LC_ALL=C grep -o '<tr' | wc -c | tr -d ' ')"
+      if [ -n "$rows" ] && [ "$rows" -ge 1 ]; then
+        pass "$name" "${day}：${size} 字节，${rows} 个 tr 起始标记"
+        return 0
+      fi
+    fi
+    tried=$((tried + 1))
   done
-  warn "$name" "两个主机均失败: ${tries}"
+  warn "$name" "最近 ${tried} 个自然日都没有数据（最后试 ${day}，${size} 字节）：可能全程休市或页面改版"
 }
+
 
 printf '观澜 · 数据源冒烟 %s（超时 %ss）\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$TIMEOUT"
 printf '%s\n' '────────────────────────────────────────────────────────────'
 
 check_ths_kline
-check_eastmoney_bkzj
-check_push2_fflow
+check_sina_bkzj_rank
+check_sina_flow_history
 check_sina_moneyflow
 check_tencent_snapshot
-check_eastmoney_kline
+check_tencent_hfq
+check_ths_limit_up
+check_ths_longhu
 
 printf '%s\n' '────────────────────────────────────────────────────────────'
 printf '统计: PASS %d，WARN %d\n' "$PASSED" "$WARNED"

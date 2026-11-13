@@ -1,0 +1,20 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-kline",
+  "data": {
+    "interval": "1d",
+    "adjust": "forward",
+    "item": [
+      {
+        "thscode": "600519.SH",
+        "timestamp": 1767110400000,
+        "item": [
+          {"date_ms":1767024000000,"open_price":1400.0,"high_price":1420.0,"low_price":1390.0,"close_price":1415.0,"volume":3000000,"turnover":4245000000.0},
+          {"date_ms":1767110400000,"open_price":1415.0,"high_price":1430.0,"low_price":1410.0,"close_price":1421.0,"volume":3950084,"turnover":5627798300.0}
+        ]
+      },
+      {"thscode": "000001.SZ", "timestamp": null, "item": []}
+    ]
+  }
+}

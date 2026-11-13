@@ -10,16 +10,16 @@ import (
 
 // Fold 是一折 walk-forward：前段调参（样本内），后段验证（样本外）。
 type Fold struct {
-	Index      int      `json:"index"`
-	TrainStart string   `json:"trainStart"`
-	TrainEnd   string   `json:"trainEnd"`
-	TestStart  string   `json:"testStart"`
-	TestEnd    string   `json:"testEnd"`
-	Best       ParamSet `json:"best"`
-	TrainSharpe float64 `json:"trainSharpe"`
-	TrainReturn float64 `json:"trainReturn"`
-	TestSharpe  float64 `json:"testSharpe"`
-	TestReturn  float64 `json:"testReturn"`
+	Index       int      `json:"index"`
+	TrainStart  string   `json:"trainStart"`
+	TrainEnd    string   `json:"trainEnd"`
+	TestStart   string   `json:"testStart"`
+	TestEnd     string   `json:"testEnd"`
+	Best        ParamSet `json:"best"`
+	TrainSharpe float64  `json:"trainSharpe"`
+	TrainReturn float64  `json:"trainReturn"`
+	TestSharpe  float64  `json:"testSharpe"`
+	TestReturn  float64  `json:"testReturn"`
 }
 
 // WalkForwardResult 汇总样本内外表现，用于判断是否过拟合。
@@ -79,7 +79,7 @@ func WalkForward(code string, bars []contract.Bar, strategyID string, grid []Par
 		best := grid[bestIdx]
 		testRes := Run(code, test, Build(strategyID, best), opt)
 		res.Folds = append(res.Folds, Fold{
-			Index: k,
+			Index:      k,
 			TrainStart: train[0].Date, TrainEnd: train[len(train)-1].Date,
 			TestStart: test[0].Date, TestEnd: test[len(test)-1].Date,
 			Best: best, TrainSharpe: round2(bestSharpe), TrainReturn: round4(bestReturn),

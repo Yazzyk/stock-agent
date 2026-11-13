@@ -212,6 +212,22 @@ export interface KlineSummary {
   atr: string
 }
 
+/** 一个时间尺度的研判：短线看 5/10/20 日动量，长线看 20/60/120 日结构。 */
+export interface KlineHorizon {
+  /** short = 短线，long = 长线 */
+  key: 'short' | 'long'
+  /** 展示标题，例如「短线（5~20 日）」 */
+  title: string
+  /** 参与计算的 K 线根数 */
+  window: number
+  /** 偏多 / 偏空 / 中性（结构结论，不是买卖建议） */
+  bias: string
+  summary: KlineSummary
+  patterns: KlinePattern[]
+  support: number[]
+  resistance: number[]
+}
+
 export interface KlineAnalyzeResponse {
   code: string
   name: string
@@ -223,9 +239,14 @@ export interface KlineAnalyzeResponse {
   warning?: string
   support: number[]
   resistance: number[]
+  /** 短线/长线双尺度研判；后端旧版本可能不返回 */
+  horizons?: KlineHorizon[]
 }
 
 // ---------- 模型设置（API.md 第 4 节） ----------
+
+/** 模型接入方式：API Key / WorkBuddy 本机登录态 / OpenCode 兼容网关。 */
+export type ModelAuthMode = 'apiKey' | 'workbuddy' | 'opencode'
 
 export interface ModelInfo {
   provider: string
@@ -235,9 +256,17 @@ export interface ModelInfo {
   hasKey: boolean
   isDefault: boolean
   maxTokens?: number
+  /** 模型上下文窗口（token），来自 provider 预设；未知为 0。 */
+  contextWindow?: number
   /** 契约里 save 用 name 作为展示名，list 回的是 displayName，这里两者都收。 */
   name?: string
   id?: string
+  /** 接入方式；缺省按 apiKey 处理（兼容旧后端） */
+  authMode?: ModelAuthMode
+  /** WorkBuddy 登录账号（仅展示，不含 token） */
+  accountName?: string
+  /** 登录态到期时间（ISO） */
+  expiresAt?: string
 }
 
 export interface ModelListPayload {
@@ -254,6 +283,7 @@ export interface ModelDraft {
   apiKey?: string
   maxTokens?: number
   setDefault?: boolean
+  authMode?: ModelAuthMode
 }
 
 export interface ModelTestResult {
@@ -274,11 +304,23 @@ export interface WorkerInfo {
   id: string
   title: string
   description: string
+  /** main = 主控（router）；preset = 预设任务 worker；custom = 用户自建 */
+  kind?: 'main' | 'preset' | 'custom'
+  /** 用户通过「创建 worker」新增的 worker（等价于 kind === 'custom'） */
+  custom?: boolean
+  /** 该 worker 的默认模型（空表示跟随全局默认） */
+  model?: string
 }
 
 export interface AgentArtifact {
   name: string
   path: string
+}
+
+/** 后端诊断条目：空回复时用它说明「为什么没产出」。code 可能为空（后端只给一句人话）。 */
+export interface AgentDiagnostic {
+  code: string
+  message: string
 }
 
 export interface AgentRunResult {
@@ -289,6 +331,24 @@ export interface AgentRunResult {
   usage?: Usage
   error?: string
   artifacts?: AgentArtifact[]
+  /** 本次实际使用的模型（空表示默认模型） */
+  model?: string
+  /** 结束原因：'stop' | 'length' | 'tool_calls' | 'content_filter' | '' */
+  finishReason?: string
+  /**
+   * 空回复的原因代码（稳定枚举，有正文时缺省）：
+   * no_response | reasoning_only | truncated | content_filter | steps | budget | tool_only | error
+   */
+  emptyReason?: string
+  /**
+   * 诊断明细：后端返回 **string[]**（每条形如「检测到 reasoning_content 非空而 content 为空…」）。
+   * 前端在 lib/data.ts 归一成 {code,message} 便于排版；这里保留两种形态以兼容旧后端。
+   */
+  diagnostics?: Array<string | AgentDiagnostic>
+  /** 推理模型的 reasoning_content 原文（可能为空） */
+  reasoning?: string
+  /** true 表示 report 其实是推理过程回退来的，不是真正的结论正文 */
+  contentFromReasoning?: boolean
 }
 
 export type AgentStatus = 'ok' | 'failed' | 'running'
@@ -310,6 +370,10 @@ export interface AgentSessionEvent {
   content: string
   toolName?: string
   ok?: boolean
+  /** 产生这条事件的会话 id（后端新契约可选字段）：
+      根会话的事件里混进子智能体 report 时，靠它区分「交付物」与「子过程产出」。
+      旧数据没有这个字段，前端按 role/顺序兜底。 */
+  sessionId?: string
 }
 
 /** agentlab.steer 返回：queued 是当前排队条数。 */
@@ -340,6 +404,13 @@ export interface AgentReportPayload {
   worker?: string
   report?: string
   usage?: Usage
+  /** 空回复归因与诊断（缺失表示后端没给） */
+  finishReason?: string
+  emptyReason?: string
+  /** 后端是 string[]；这里放开成 unknown，由 store 归一 */
+  diagnostics?: unknown
+  reasoning?: string
+  contentFromReasoning?: boolean
 }
 
 // ---------- 知识库（API.md 第 6 节） ----------
@@ -423,6 +494,10 @@ export interface StrategySpec {
   desc: string
   params?: ParamDef[]
   default?: Record<string, number>
+  /** 策略规则（逐条中文说明，UI 直接展示，解决「不知道算法是什么」） */
+  rules?: string[]
+  /** 一句话信号公式，例如「MA(fast) > MA(slow) → 满仓」 */
+  formula?: string
 }
 
 export interface QuantTrade {
@@ -473,6 +548,15 @@ export interface QuantResult {
   warnings?: string[]
 }
 
+/** 逐笔成交（回测结果顶层 trades / result.fills），用于在 K 线上画买卖标记。 */
+export interface QuantFill {
+  date: string
+  side: 'buy' | 'sell'
+  price: number
+  qty: number
+  reason?: string
+}
+
 export interface QuantRunResponse {
   code: string
   period: string
@@ -481,6 +565,8 @@ export interface QuantRunResponse {
   warning?: string
   result: QuantResult
   report: string
+  /** 逐笔成交（≤500）；result.trades 仍是旧的平仓交易数组，两者语义不同。 */
+  trades?: QuantFill[]
 }
 
 export interface WalkForwardFold {
@@ -510,6 +596,37 @@ export interface WalkForwardResult {
 export interface WalkForwardResponse {
   result: WalkForwardResult
   report: string
+}
+
+/** 参数优化候选：样本内指标 + 稳健性（邻域参数表现）。 */
+export interface OptimizeCandidate {
+  params: Record<string, number>
+  totalReturn: number
+  cagr: number
+  maxDrawdown: number
+  sharpe: number
+  tradeCount: number
+  /** 邻域稳健性 0~1：参数轻微扰动后夏普的平均衰减，越高越稳 */
+  stability?: number
+}
+
+export interface OptimizeResult {
+  strategy: string
+  code: string
+  start: string
+  end: string
+  /** 网格中按夏普排序的前 N 个候选 */
+  candidates: OptimizeCandidate[]
+  /** 综合样本内表现与稳健性选出的推荐参数 */
+  best: OptimizeCandidate | null
+  /** 推荐参数在 walk-forward 上的样本外表现 */
+  walkforward?: WalkForwardResult
+  report: string
+  note?: string
+}
+
+export interface OptimizeResponse {
+  result: OptimizeResult
 }
 
 // ---------- Watch 哨兵（API.md §5.6，插件 id=watch） ----------
@@ -606,6 +723,118 @@ export interface WatchListPayload {
 export interface WatchTemplatesPayload {
   templates: WatchRule[]
   metrics: WatchMetricSpec[]
+}
+
+// ---------- 分时（market.minute / kline.minute） ----------
+
+export interface MinutePoint {
+  /** HH:MM */
+  time: string
+  price: number
+  /** 均价，数据源未提供时为 undefined */
+  avg?: number
+  /** 分钟成交量（手） */
+  volume?: number
+  /** 分钟成交额（元） */
+  amount?: number
+}
+
+export interface MinuteSeries {
+  code: string
+  name: string
+  date: string
+  prevClose: number
+  points: MinutePoint[]
+  source?: string
+}
+
+// ---------- 市场中心（plugins/marketcenter） ----------
+
+export interface MarketIndex {
+  code: string
+  name: string
+  price: number
+  change: number
+  changePct: number
+  amount?: number
+}
+
+export interface MarketBreadth {
+  date: string
+  up: number
+  down: number
+  flat: number
+  limitUp: number
+  limitDown: number
+  /** 炸板数（触及涨停后打开） */
+  broken: number
+  /** 炸板率 0~100 */
+  brokenRate: number
+  amount?: number
+}
+
+export interface LimitUpStock {
+  code: string
+  name: string
+  price: number
+  changePct: number
+  /** 连续涨停板数（首板=1） */
+  boards: number
+  firstTime?: string
+  lastTime?: string
+  /** 涨停原因/所属题材 */
+  reason?: string
+  amount?: number
+  turnover?: number
+}
+
+export interface HotStock {
+  code: string
+  name: string
+  /** SH / SZ；未知为空 */
+  market?: string
+  price?: number
+  changePct: number
+  /** 热度分（同花顺 rate） */
+  heat: number
+  rank: number
+  /** 排名变化：正数表示上升 */
+  rankChange?: number
+  conceptTags?: string[]
+  popularityTag?: string
+  /** 上榜原因（小时榜通常有） */
+  reason?: string
+}
+
+export interface HotStock {
+  code: string
+  name: string
+  /** SH / SZ；未知为空 */
+  market?: string
+  price?: number
+  changePct: number
+  /** 热度分（同花顺 rate） */
+  heat: number
+  rank: number
+  /** 排名变化：正数表示上升 */
+  rankChange?: number
+  conceptTags?: string[]
+  popularityTag?: string
+  /** 上榜原因（小时榜通常有） */
+  reason?: string
+}
+
+export interface LongHuRow {
+  code: string
+  name: string
+  price: number
+  changePct: number
+  reason: string
+  /** 龙虎榜净买入额（元） */
+  netBuy: number
+  buy: number
+  sell: number
+  date: string
 }
 
 // ---------- 内核事件 ----------

@@ -81,7 +81,7 @@ func (g *Guard) Policy() contract.Policy {
 }
 
 // AllowHost 判断主机是否命中白名单：完全相等或以 "."+规则 结尾的才算命中，
-// 避免 "eastmoney.com.evil.com" 这类后缀伪装。
+// 避免 "sinajs.cn.evil.com" 这类后缀伪装。
 func (g *Guard) AllowHost(host string) bool {
 	h := normalizeHost(host)
 	if h == "" {
@@ -163,7 +163,7 @@ func Redact(s string) string {
 
 // normalizeHost 从 URL / host[:port] / 纯域名里取出小写主机名。
 // 任何"看起来像 authority 但不合法"的输入（端口不是数字、带多余路径等）都返回空串，
-// 走拒绝分支，避免 "eastmoney.com:443.evil.com" 这种伪装被后缀匹配放过。
+// 走拒绝分支，避免 "sinajs.cn:443.evil.com" 这种伪装被后缀匹配放过。
 func normalizeHost(host string) string {
 	h := strings.TrimSpace(host)
 	if h == "" {

@@ -3,6 +3,7 @@
 
 import { callTool, friendlyError, invoke } from '../api'
 import type {
+  AgentDiagnostic,
   AgentRunResult,
   AgentSession,
   AgentSessionDetail,
@@ -15,6 +16,9 @@ import type {
   FundFlow,
   ImportResult,
   KlineAnalyzeResponse,
+  OptimizeResponse,
+  OptimizeResult,
+  OptimizeCandidate,
   KbHit,
   KbSearchPayload,
   KlineResponse,
@@ -43,6 +47,7 @@ import type {
 import {
   arr,
   pickArr,
+  pickBool,
   pickNum,
   pickStr,
   rec,
@@ -56,6 +61,7 @@ import {
   toMaSeries,
   toModelInfo,
   toNumList,
+  toQuantFills,
   toQuantResult,
   toStrategySpec,
   toWalkForward,
@@ -145,8 +151,13 @@ export function flowStock(code: string): Promise<FundFlow> {
   return guard('查询个股资金流', async () => toFundFlow(await invoke('fundflow', 'stock', { code })))
 }
 
-export function flowRank(kind: FlowKind, limit = 50): Promise<FundFlow[]> {
-  return guard('查询资金流排名', async () => arr(await invoke('fundflow', 'rank', { kind, limit })).map(toFundFlow))
+/** 资金流排名方向：in=主力净流入榜，out=主力净流出榜，all=按净额降序（兼容旧行为）。 */
+export type FlowRankDirection = 'in' | 'out' | 'all'
+
+export function flowRank(kind: FlowKind, limit = 50, direction: FlowRankDirection = 'all'): Promise<FundFlow[]> {
+  return guard('查询资金流排名', async () =>
+    arr(await invoke('fundflow', 'rank', { kind, limit, direction })).map(toFundFlow),
+  )
 }
 
 export function sectors(kind: FlowKind): Promise<Sector[]> {
@@ -214,6 +225,11 @@ export function modelSave(draft: ModelDraft): Promise<ModelListPayload> {
   return guard('保存模型配置', async () => toModelList(await invoke('modelsettings', 'save', payload)))
 }
 
+/** 把某条已保存的模型配置设为全局默认（不需要重新填写 Key）。 */
+export function modelSetDefault(id: string): Promise<ModelListPayload> {
+  return guard('设置默认模型', async () => toModelList(await invoke('modelsettings', 'setDefault', { id })))
+}
+
 export function modelTest(id: string): Promise<ModelTestResult> {
   return guard('测试模型连通', async () => {
     const r = rec(await invoke('modelsettings', 'test', { id })) ?? {}
@@ -232,12 +248,32 @@ export function modelRemove(id: string): Promise<ModelListPayload> {
 // ---------- Agent ----------
 
 export function agentWorkers(): Promise<WorkerInfo[]> {
+  // 后端返回 {workers:[...], mainId, total}；arr() 会取 workers，同时兼容旧的裸数组。
+  // kind（main/preset/custom）在 toWorker 里归一。
   return guard('读取 worker 列表', async () => arr(await invoke('agentlab', 'workers', {})).map(toWorker))
 }
 
-export function agentRun(worker: string, input: string, sessionId?: string): Promise<AgentRunResult> {
+/**
+ * 诊断条目归一。
+ * 后端契约：diagnostics 是 **string[]**，每条形如
+ * 「检测到 reasoning_content 非空而 content 为空：该模型是推理模型，正文被推理占满」。
+ * 前端仍然用 {code,message} 承载（code 留空，只用于排版时占不占一列），
+ * 同时保留对早期 {code,message} 对象数组的兼容，避免旧后端把告警卡变空白。
+ */
+function toAgentDiagnostic(v: unknown): AgentDiagnostic {
+  if (typeof v === 'string') {
+    const message = v.trim()
+    return { code: '', message }
+  }
+  const r = rec(v) ?? {}
+  return { code: pickStr(r, 'code') ?? '', message: pickStr(r, 'message', 'detail', 'reason') ?? '' }
+}
+
+export function agentRun(worker: string, input: string, sessionId?: string, model?: string): Promise<AgentRunResult> {
   return guard('运行 Agent', async () => {
-    const r = rec(await invoke('agentlab', 'run', { worker, input, sessionId })) ?? {}
+    const payload: Record<string, unknown> = { worker, input, sessionId }
+    if (model) payload.model = model
+    const r = rec(await invoke('agentlab', 'run', payload)) ?? {}
     return {
       sessionId: pickStr(r, 'sessionId') ?? '',
       worker: pickStr(r, 'worker') ?? worker,
@@ -249,6 +285,13 @@ export function agentRun(worker: string, input: string, sessionId?: string): Pro
         totalTokens: pickNum(rec(r.usage) ?? {}, 'totalTokens') ?? 0,
       } : undefined,
       error: pickStr(r, 'error'),
+      model: pickStr(r, 'model') || undefined,
+      // 诊断字段由后端新增：缺失时留空，前端据此判定「无诊断信息」
+      finishReason: pickStr(r, 'finishReason') ?? '',
+      emptyReason: pickStr(r, 'emptyReason') ?? '',
+      diagnostics: pickArr(r, 'diagnostics').map(toAgentDiagnostic).filter((d) => d.message !== ''),
+      reasoning: pickStr(r, 'reasoning') ?? '',
+      contentFromReasoning: pickBool(r, 'contentFromReasoning') === true,
       artifacts: pickArr(r, 'artifacts')
         .map((a) => rec(a))
         .filter((a): a is Record<string, unknown> => a !== null)
@@ -372,11 +415,27 @@ export interface QuantRunInput {
   adjust?: string
 }
 
-export function quantStrategies(): Promise<StrategySpec[]> {
+export interface QuantStrategiesPayload {
+  strategies: StrategySpec[]
+  /** 全局成交/成本/复权/统计口径（后端 backtest.Rules()） */
+  rules: string[]
+}
+
+/** 策略清单 + 全局口径；算法说明区域用它渲染，不必让面板直接拼 invoke。 */
+export function quantStrategiesPayload(): Promise<QuantStrategiesPayload> {
   return guard('读取策略列表', async () => {
     const r = rec(await invoke('quant', 'strategies', {})) ?? {}
-    return (pickArr(r, 'strategies').length > 0 ? pickArr(r, 'strategies') : arr(r)).map(toStrategySpec)
+    const raw = pickArr(r, 'strategies').length > 0 ? pickArr(r, 'strategies') : arr(r)
+    return {
+      strategies: raw.map(toStrategySpec),
+      rules: strList(pickArr(r, 'rules')),
+    }
   })
+}
+
+/** 只要策略清单的兼容入口。 */
+export function quantStrategies(): Promise<StrategySpec[]> {
+  return quantStrategiesPayload().then((r) => r.strategies)
 }
 
 export function quantRun(input: QuantRunInput): Promise<QuantRunResponse> {
@@ -395,6 +454,7 @@ export function quantRun(input: QuantRunInput): Promise<QuantRunResponse> {
       warning: pickStr(r, 'warning'),
       result: toQuantResult(r.result),
       report: pickStr(r, 'report') ?? '',
+      trades: toQuantFills(r.trades ?? (r.result as Record<string, unknown> | undefined)?.fills),
     }
   })
 }
@@ -406,6 +466,165 @@ export function quantWalkForward(code: string, strategy: string, folds = 3, limi
       result: toWalkForward(r.result),
       report: pickStr(r, 'report') ?? '',
     }
+  })
+}
+
+/**
+ * 量化参数优化：后端在默认网格上做样本内筛选 + 邻域稳健性，再对推荐参数跑 walk-forward。
+ * 返回可直接渲染的候选表与结论，不返回净值序列（省传输）。
+ */
+export function quantOptimize(code: string, strategy: string, folds = 3, limit = 500): Promise<OptimizeResult> {
+  return guard('运行参数优化', async () => {
+    const r = rec(await invoke('quant', 'optimize', { code, strategy, folds, limit })) ?? {}
+    const result = rec(r.result) ?? r
+    return toOptimizeResult(result)
+  })
+}
+
+/** 把 optimize 的原始返回归一成 OptimizeResult。 */
+function toOptimizeResult(v: Record<string, unknown>): OptimizeResult {
+  const candidates = pickArr(v, 'candidates').map((x) => {
+    const c = rec(x) ?? {}
+    const rawParams = rec(c.params) ?? {}
+    const params: Record<string, number> = {}
+    for (const k of Object.keys(rawParams)) {
+      const n = pickNum(rawParams, k)
+      if (n !== undefined) params[k] = n
+    }
+    const out: OptimizeCandidate = {
+      params,
+      totalReturn: pickNum(c, 'totalReturn') ?? 0,
+      cagr: pickNum(c, 'cagr') ?? 0,
+      maxDrawdown: pickNum(c, 'maxDrawdown') ?? 0,
+      sharpe: pickNum(c, 'sharpe') ?? 0,
+      tradeCount: pickNum(c, 'tradeCount') ?? 0,
+      stability: pickNum(c, 'stability'),
+    }
+    return out
+  })
+  const rawBest = rec(v.best)
+  const best = rawBest
+    ? (candidates.find((c) => JSON.stringify(c.params) === JSON.stringify(pickNumMap(rawBest.params))) ?? candidates[0] ?? null)
+    : (candidates[0] ?? null)
+  const wf = rec(v.walkforward)
+  return {
+    strategy: pickStr(v, 'strategy') ?? '',
+    code: pickStr(v, 'code') ?? '',
+    start: pickStr(v, 'start') ?? '',
+    end: pickStr(v, 'end') ?? '',
+    candidates,
+    best: best ?? (rawBest ? {
+      params: pickNumMap(rawBest.params),
+      totalReturn: pickNum(rawBest, 'totalReturn') ?? 0,
+      cagr: pickNum(rawBest, 'cagr') ?? 0,
+      maxDrawdown: pickNum(rawBest, 'maxDrawdown') ?? 0,
+      sharpe: pickNum(rawBest, 'sharpe') ?? 0,
+      tradeCount: pickNum(rawBest, 'tradeCount') ?? 0,
+      stability: pickNum(rawBest, 'stability'),
+    } : null),
+    walkforward: wf ? toWalkForward(wf) : undefined,
+    report: pickStr(v, 'report') ?? '',
+    note: pickStr(v, 'note'),
+  }
+}
+
+/** 把任意参数对象里的数值取出来（忽略字符串/空值）。 */
+function pickNumMap(v: unknown): Record<string, number> {
+  const r = rec(v) ?? {}
+  const out: Record<string, number> = {}
+  for (const k of Object.keys(r)) {
+    const n = pickNum(r, k)
+    if (n !== undefined) out[k] = n
+  }
+  return out
+}
+
+// ---------- WorkBuddy / OpenCode 接入 ----------
+
+/** WorkBuddy 本机登录态（不含 token，只给界面展示）。 */
+export interface WorkBuddyStatus {
+  loggedIn: boolean
+  accountName?: string
+  domain?: string
+  expiresAt?: string
+  vaultPath?: string
+  message?: string
+}
+
+/** WorkBuddy 模型目录条目（来自 /v2/enterprises/personal/models）。 */
+export interface WorkBuddyModel {
+  id: string
+  name: string
+  contextWindow: number
+  maxOutputTokens: number
+  creditHint?: string
+  supportsImages?: boolean
+  description?: string
+  isImageModel?: boolean
+}
+
+export function workbuddyStatus(): Promise<WorkBuddyStatus> {
+  return guard('读取 WorkBuddy 登录态', async () => {
+    const r = rec(await invoke('modelsettings', 'workbuddyStatus', {})) ?? {}
+    return {
+      loggedIn: r.loggedIn === true,
+      accountName: pickStr(r, 'accountName'),
+      domain: pickStr(r, 'domain'),
+      expiresAt: pickStr(r, 'expiresAt'),
+      vaultPath: pickStr(r, 'vaultPath'),
+      message: pickStr(r, 'message'),
+    }
+  })
+}
+
+export function workbuddyModels(): Promise<WorkBuddyModel[]> {
+  return guard('读取 WorkBuddy 模型目录', async () => {
+    const r = rec(await invoke('modelsettings', 'workbuddyModels', {})) ?? {}
+    return pickArr(r, 'models').map((x) => {
+      const m = rec(x) ?? {}
+      return {
+        id: pickStr(m, 'id') ?? '',
+        name: pickStr(m, 'name', 'id') ?? '',
+        contextWindow: pickNum(m, 'contextWindow') ?? 0,
+        maxOutputTokens: pickNum(m, 'maxOutputTokens') ?? 0,
+        creditHint: pickStr(m, 'creditHint'),
+        supportsImages: m.supportsImages === true,
+        description: pickStr(m, 'description'),
+        isImageModel: m.isImageModel === true,
+      }
+    }).filter((m) => m.id !== '')
+  })
+}
+
+/** 发起 WorkBuddy 扫码/浏览器登录；返回登录会话 id 与授权地址。 */
+export function workbuddyLoginStart(region: 'cn' | 'global'): Promise<{ loginId: string; url: string }> {
+  return guard('发起 WorkBuddy 登录', async () => {
+    const r = rec(await invoke('modelsettings', 'workbuddyLogin', { region })) ?? {}
+    return { loginId: pickStr(r, 'loginId') ?? '', url: pickStr(r, 'url') ?? '' }
+  })
+}
+
+/** 轮询登录结果；ok=true 表示凭证已落盘。 */
+export function workbuddyLoginPoll(loginId: string): Promise<{ ok: boolean; message: string; accountName?: string }> {
+  return guard('等待 WorkBuddy 登录', async () => {
+    const r = rec(await invoke('modelsettings', 'workbuddyLoginPoll', { loginId })) ?? {}
+    return { ok: r.ok === true, message: pickStr(r, 'message') ?? '', accountName: pickStr(r, 'accountName') }
+  })
+}
+
+/** 从本机 dsh / go-stock 的 WorkBuddy 凭证库导入一次。 */
+export function workbuddyImport(): Promise<{ message: string }> {
+  return guard('导入 WorkBuddy 登录态', async () => {
+    const r = rec(await invoke('modelsettings', 'workbuddyImport', {})) ?? {}
+    return { message: pickStr(r, 'message') ?? '' }
+  })
+}
+
+/** 退出 WorkBuddy 登录（删除本地凭证）。 */
+export function workbuddyLogout(): Promise<{ message: string }> {
+  return guard('退出 WorkBuddy', async () => {
+    const r = rec(await invoke('modelsettings', 'workbuddyLogout', {})) ?? {}
+    return { message: pickStr(r, 'message') ?? '' }
   })
 }
 

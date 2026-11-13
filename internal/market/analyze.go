@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/yazzyk/stock-agent/pkg/contract"
 )
@@ -61,12 +62,39 @@ type Analysis struct {
 	Indicators Indicators   `json:"indicators"`
 }
 
+// HorizonAnalysis 是单一时间尺度（短线/长线）的结构研判，字段名与前端契约逐字对齐。
+type HorizonAnalysis struct {
+	Key        string    `json:"key"`
+	Title      string    `json:"title"`
+	Window     int       `json:"window"`
+	Bias       string    `json:"bias"`
+	Summary    Summary   `json:"summary"`
+	Patterns   []Pattern `json:"patterns"`
+	Support    []float64 `json:"support"`
+	Resistance []float64 `json:"resistance"`
+}
+
 // 分析用的默认参数，集中在一处，避免面板与工具口径漂移。
 const (
 	analyzeRSIPeriod   = 14
 	analyzeATRPeriod   = 14
 	analyzePatternSpan = 30
 	structureLookback  = 120
+)
+
+// 双尺度研判的窗口、阈值与三态结论字面量；前端按「偏多/偏空/中性」着色，改动即破坏兼容。
+const (
+	horizonShort = "short"
+	horizonLong  = "long"
+
+	shortHorizonWindow = 60
+	longHorizonWindow  = 250
+	longMinSample      = 120
+	horizonPatternSpan = 30
+
+	biasBull    = "偏多"
+	biasBear    = "偏空"
+	biasNeutral = "中性"
 )
 
 // Analyze 汇总最近一段行情：摘要 + 形态 + 结构位 + 指标序列。
@@ -351,4 +379,333 @@ func lastValue(s []float64, i int) float64 {
 		return math.NaN()
 	}
 	return s[i]
+}
+
+// AnalyzeHorizons 按「短线 + 长线」两个尺度各算一份研判，顺序固定为短线在前。
+func AnalyzeHorizons(bars []contract.Bar) []HorizonAnalysis {
+	return []HorizonAnalysis{
+		AnalyzeHorizon(bars, horizonShort),
+		AnalyzeHorizon(bars, horizonLong),
+	}
+}
+
+// AnalyzeHorizon 计算单一尺度的结构研判：短线取最近 60 根，长线取最近 250 根。
+// 结论只做结构描述，不给出买卖指令；样本不足时在摘要里明确提示。
+func AnalyzeHorizon(bars []contract.Bar, horizon string) HorizonAnalysis {
+	key := normalizeHorizon(horizon)
+	window := horizonWindow(bars, key)
+	out := HorizonAnalysis{
+		Key:    key,
+		Title:  horizonTitle(key),
+		Window: len(window),
+		Bias:   biasNeutral,
+		Summary: Summary{
+			Trend: "K 线样本为空，暂不研判",
+			MA:    "均线样本不足",
+			RSI:   "RSI 样本不足",
+			MACD:  "MACD 样本不足",
+			ATR:   "ATR 样本不足",
+		},
+		Patterns:   []Pattern{},
+		Support:    []float64{},
+		Resistance: []float64{},
+	}
+	if len(window) == 0 {
+		return out
+	}
+
+	last := window[len(window)-1]
+	closes := Closes(window)
+	rsi := RSI(closes, analyzeRSIPeriod)
+	atr := ATR(window, analyzeATRPeriod)
+	dif, dea, hist := MACD(closes, 12, 26, 9)
+
+	var bias, reason, trend string
+	if key == horizonLong {
+		bias, reason = longBias(window, dif, dea)
+		trend = longTrendSummary(window)
+		out.Summary = Summary{
+			Trend: trendWithBias(trend, bias, reason),
+			MA:    longMASummary(window),
+			RSI:   rsiSummary(rsi),
+			MACD:  macdSummary(dif, dea, hist),
+			ATR:   atrSummary(last, atr),
+		}
+	} else {
+		bias, reason = shortBias(window, rsi, dif, dea)
+		trend = shortTrendSummary(window)
+		out.Summary = Summary{
+			Trend: trendWithBias(trend, bias, reason),
+			MA:    maSummary(window, ComputeIndicators(window)),
+			RSI:   rsiSummary(rsi),
+			MACD:  macdSummary(dif, dea, hist),
+			ATR:   atrSummary(last, atr),
+		}
+	}
+	out.Bias = bias
+	out.Patterns = PatternsRecent(window, horizonPatternSpan)
+	out.Support, out.Resistance = Structure(window, len(window))
+	return out
+}
+
+// normalizeHorizon 归一化尺度参数，未知值回落到短线。
+func normalizeHorizon(horizon string) string {
+	if strings.EqualFold(strings.TrimSpace(horizon), horizonLong) {
+		return horizonLong
+	}
+	return horizonShort
+}
+
+// horizonTitle 返回尺度标题，面板直接展示；周期可切换，因此用根数而非「日」描述。
+func horizonTitle(key string) string {
+	if key == horizonLong {
+		return "长线（近 250 根）"
+	}
+	return "短线（近 60 根）"
+}
+
+// horizonWindow 截取尺度对应的 K 线窗口：短线 60 根，长线 250 根，不足则用全部。
+func horizonWindow(bars []contract.Bar, key string) []contract.Bar {
+	limit := shortHorizonWindow
+	if key == horizonLong {
+		limit = longHorizonWindow
+	}
+	if len(bars) > limit {
+		return bars[len(bars)-limit:]
+	}
+	return bars
+}
+
+// trendWithBias 把三态结论与一句理由并入趋势摘要，前端不必再拼接。
+func trendWithBias(trend, bias, reason string) string {
+	if reason == "" {
+		return trend + "；结构结论" + bias
+	}
+	return fmt.Sprintf("%s；结构结论%s（%s）", trend, bias, reason)
+}
+
+// shortTrendSummary 描述短线 MA5/MA10/MA20 排列与收盘相对 MA20 的位置。
+func shortTrendSummary(bars []contract.Bar) string {
+	last := bars[len(bars)-1]
+	if len(bars) < 20 {
+		return fmt.Sprintf("样本仅 %d 根（不足 20 根），短线均线体系不完整，暂不判定趋势", len(bars))
+	}
+	closes := Closes(bars)
+	ma5 := lastValue(SMA(closes, 5), len(closes)-1)
+	ma10 := lastValue(SMA(closes, 10), len(closes)-1)
+	ma20 := lastValue(SMA(closes, 20), len(closes)-1)
+	switch {
+	case ma5 > ma10 && ma10 > ma20:
+		return fmt.Sprintf("短线多头排列（MA5>MA10>MA20），收盘 %.2f 位于 MA20 %.2f 上方", last.Close, ma20)
+	case ma5 < ma10 && ma10 < ma20:
+		return fmt.Sprintf("短线空头排列（MA5<MA10<MA20），收盘 %.2f 位于 MA20 %.2f 下方", last.Close, ma20)
+	default:
+		position := "上方"
+		if last.Close < ma20 {
+			position = "下方"
+		}
+		return fmt.Sprintf("短线均线纠缠（MA5 %.2f / MA10 %.2f / MA20 %.2f），收盘位于 MA20 %s", ma5, ma10, ma20, position)
+	}
+}
+
+// shortBias 归纳短线三态倾向并给出结构理由；样本不足 20 根时回到中性。
+func shortBias(bars []contract.Bar, rsi, dif, dea []float64) (bias, reason string) {
+	if len(bars) < 20 {
+		return biasNeutral, fmt.Sprintf("样本仅 %d 根，不足 20 根，尚不足以判断短线结构", len(bars))
+	}
+	closes := Closes(bars)
+	last := bars[len(bars)-1]
+	ma5 := lastValue(SMA(closes, 5), len(closes)-1)
+	ma10 := lastValue(SMA(closes, 10), len(closes)-1)
+	ma20 := lastValue(SMA(closes, 20), len(closes)-1)
+
+	score := 0
+	parts := make([]string, 0, 4)
+	switch {
+	case ma5 > ma10 && ma10 > ma20:
+		score += 2
+		parts = append(parts, "MA5>MA10>MA20")
+	case ma5 < ma10 && ma10 < ma20:
+		score -= 2
+		parts = append(parts, "MA5<MA10<MA20")
+	default:
+		parts = append(parts, "均线纠缠")
+	}
+	if last.Close >= ma20 {
+		score++
+		parts = append(parts, "收盘站上 MA20")
+	} else {
+		score--
+		parts = append(parts, "收盘位于 MA20 下方")
+	}
+	if d, e := lastValue(dif, len(dif)-1), lastValue(dea, len(dea)-1); valid(d) && valid(e) {
+		switch {
+		case d > e:
+			score++
+			parts = append(parts, "MACD 处于多头")
+		case d < e:
+			score--
+			parts = append(parts, "MACD 处于空头")
+		}
+	}
+	if v := lastValue(rsi, len(rsi)-1); valid(v) {
+		switch {
+		case v >= 55:
+			score++
+			parts = append(parts, fmt.Sprintf("RSI %.1f 偏强", v))
+		case v <= 45:
+			score--
+			parts = append(parts, fmt.Sprintf("RSI %.1f 偏弱", v))
+		default:
+			parts = append(parts, fmt.Sprintf("RSI %.1f 中性", v))
+		}
+	}
+	switch {
+	case score >= 2:
+		bias = biasBull
+	case score <= -2:
+		bias = biasBear
+	default:
+		bias = biasNeutral
+	}
+	return bias, strings.Join(parts, "、")
+}
+
+// longTrendSummary 描述长线均线排列、收盘相对 MA60/MA120 的位置与窗口回撤结构。
+func longTrendSummary(bars []contract.Bar) string {
+	last := bars[len(bars)-1]
+	closes := Closes(bars)
+	ma20 := lastValue(SMA(closes, 20), len(closes)-1)
+	ma60 := lastValue(SMA(closes, 60), len(closes)-1)
+	ma120 := lastValue(SMA(closes, 120), len(closes)-1)
+
+	parts := make([]string, 0, 6)
+	if valid(ma20) && valid(ma60) {
+		if ma20 >= ma60 {
+			parts = append(parts, "MA20 位于 MA60 上方")
+		} else {
+			parts = append(parts, "MA20 位于 MA60 下方")
+		}
+	}
+	if valid(ma60) && valid(ma120) {
+		if ma60 >= ma120 {
+			parts = append(parts, "MA60 位于 MA120 上方")
+		} else {
+			parts = append(parts, "MA60 位于 MA120 下方")
+		}
+	}
+	if valid(ma60) {
+		if last.Close >= ma60 {
+			parts = append(parts, fmt.Sprintf("收盘 %.2f 站上 MA60 %.2f", last.Close, ma60))
+		} else {
+			parts = append(parts, fmt.Sprintf("收盘 %.2f 位于 MA60 %.2f 下方", last.Close, ma60))
+		}
+	} else {
+		parts = append(parts, "MA60 样本不足（需 60 根）")
+	}
+	if valid(ma120) {
+		if last.Close >= ma120 {
+			parts = append(parts, "站上 MA120")
+		} else {
+			parts = append(parts, "位于 MA120 下方")
+		}
+	} else {
+		parts = append(parts, "MA120 样本不足（需 120 根）")
+	}
+	parts = append(parts, fmt.Sprintf("窗口内最大回撤 %.1f%%", MaxDrawdown(closes)*100))
+
+	text := "长线结构：" + strings.Join(parts, "，")
+	if len(bars) < longMinSample {
+		text = fmt.Sprintf("样本仅 %d 根（不足 %d 根，长线结论仅供参考）。%s", len(bars), longMinSample, text)
+	}
+	return text
+}
+
+// longMASummary 给出长线均线数值；不足 120 根时明确标注 MA120 缺失。
+func longMASummary(bars []contract.Bar) string {
+	last := bars[len(bars)-1]
+	closes := Closes(bars)
+	ma20 := lastValue(SMA(closes, 20), len(closes)-1)
+	ma60 := lastValue(SMA(closes, 60), len(closes)-1)
+	ma120 := lastValue(SMA(closes, 120), len(closes)-1)
+	if len(bars) < longMinSample {
+		if valid(ma20) && valid(ma60) {
+			return fmt.Sprintf("样本 %d 根，MA120 不足（需 %d 根）；收盘 %.2f，MA20 %.2f，MA60 %.2f", len(bars), longMinSample, last.Close, ma20, ma60)
+		}
+		return fmt.Sprintf("样本仅 %d 根，长线均线（MA20/MA60/MA120）样本不足", len(bars))
+	}
+	if valid(ma20) && valid(ma60) && valid(ma120) && ma60 != 0 {
+		return fmt.Sprintf("收盘 %.2f，MA20 %.2f，MA60 %.2f，MA120 %.2f，距 MA60 %+.2f%%", last.Close, ma20, ma60, ma120, (last.Close/ma60-1)*100)
+	}
+	return fmt.Sprintf("收盘 %.2f（长线均线样本不足）", last.Close)
+}
+
+// longBias 归纳长线三态倾向并给出结构理由；MA120 缺失时按可得均线降级判断。
+func longBias(bars []contract.Bar, dif, dea []float64) (bias, reason string) {
+	if len(bars) < 20 {
+		return biasNeutral, fmt.Sprintf("样本仅 %d 根，不足 20 根，尚不足以判断长线结构", len(bars))
+	}
+	closes := Closes(bars)
+	last := bars[len(bars)-1]
+	ma20 := lastValue(SMA(closes, 20), len(closes)-1)
+	ma60 := lastValue(SMA(closes, 60), len(closes)-1)
+	ma120 := lastValue(SMA(closes, 120), len(closes)-1)
+
+	score := 0
+	parts := make([]string, 0, 5)
+	if valid(ma20) {
+		if last.Close >= ma20 {
+			score++
+			parts = append(parts, "收盘位于 MA20 上方")
+		} else {
+			score--
+			parts = append(parts, "收盘位于 MA20 下方")
+		}
+	}
+	if valid(ma60) {
+		if last.Close >= ma60 {
+			score++
+			parts = append(parts, "收盘位于 MA60 上方")
+		} else {
+			score--
+			parts = append(parts, "收盘位于 MA60 下方")
+		}
+		if valid(ma20) {
+			if ma20 >= ma60 {
+				score++
+				parts = append(parts, "MA20 在 MA60 上方")
+			} else {
+				score--
+				parts = append(parts, "MA20 在 MA60 下方")
+			}
+		}
+	}
+	if valid(ma60) && valid(ma120) {
+		if ma60 >= ma120 {
+			score++
+			parts = append(parts, "MA60 在 MA120 上方")
+		} else {
+			score--
+			parts = append(parts, "MA60 在 MA120 下方")
+		}
+	}
+	if d, e := lastValue(dif, len(dif)-1), lastValue(dea, len(dea)-1); valid(d) && valid(e) {
+		switch {
+		case d > e:
+			score++
+			parts = append(parts, "MACD 处于多头")
+		case d < e:
+			score--
+			parts = append(parts, "MACD 处于空头")
+		}
+	}
+	switch {
+	case score >= 2:
+		bias = biasBull
+	case score <= -2:
+		bias = biasBear
+	default:
+		bias = biasNeutral
+	}
+	return bias, strings.Join(parts, "、")
 }

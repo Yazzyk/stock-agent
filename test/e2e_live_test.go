@@ -305,6 +305,169 @@ func TestLiveEndToEnd(t *testing.T) {
 		}
 	}
 
+	// ---------- 5.1 资金流出榜：direction=out 必须给最负的前 N 条 ----------
+	var outRank struct {
+		Items []struct {
+			Code    string  `json:"code"`
+			Name    string  `json:"name"`
+			MainNet float64 `json:"mainNet"`
+			Rank    int     `json:"rank"`
+		} `json:"items"`
+	}
+	raw, err = k.CallTool(ctx, "flow.rank", json.RawMessage(`{"kind":"sector","limit":5,"direction":"out"}`))
+	if err != nil {
+		t.Fatalf("flow.rank(direction=out) 调用失败: %v", err)
+	}
+	if err := json.Unmarshal(raw, &outRank); err != nil {
+		t.Fatalf("flow.rank(out) 返回不是合法 JSON: %v", err)
+	}
+	if len(outRank.Items) == 0 {
+		t.Fatal("资金流出榜不应为空")
+	}
+	for i, it := range outRank.Items {
+		if it.Rank != i+1 {
+			t.Fatalf("流出榜名次应连续，第 %d 条 rank=%d", i+1, it.Rank)
+		}
+		if it.MainNet > 0 {
+			t.Fatalf("流出榜应全部为净流出，%s mainNet=%v", it.Name, it.MainNet)
+		}
+		if i > 0 && it.MainNet < outRank.Items[i-1].MainNet {
+			t.Fatalf("流出榜应按净额升序（最负在前）：%s %v 在 %s %v 之后", it.Name, it.MainNet, outRank.Items[i-1].Name, outRank.Items[i-1].MainNet)
+		}
+	}
+
+	// ---------- 5.1.1 板块/概念多日资金流：BK 代码走 90.<BK> 端点 ----------
+	var sectorFlow struct {
+		Code   string `json:"code"`
+		Name   string `json:"name"`
+		Points []struct {
+			Date    string  `json:"date"`
+			MainNet float64 `json:"mainNet"`
+		} `json:"points"`
+	}
+	if outRank.Items[0].Code == "" {
+		t.Fatal("资金流出榜首条缺少 code，无法验证多日资金流")
+	}
+	raw, err = k.CallTool(ctx, "sector.history", json.RawMessage(`{"code":"`+outRank.Items[0].Code+`","days":10}`))
+	if err != nil {
+		t.Fatalf("sector.history 调用失败: %v", err)
+	}
+	if err := json.Unmarshal(raw, &sectorFlow); err != nil {
+		t.Fatalf("sector.history 返回不是合法 JSON: %v", err)
+	}
+	if sectorFlow.Code == "" || len(sectorFlow.Points) == 0 {
+		t.Fatalf("板块多日资金流不应为空: code=%q points=%d", sectorFlow.Code, len(sectorFlow.Points))
+	}
+	for i, pt := range sectorFlow.Points {
+		if pt.Date == "" {
+			t.Fatalf("第 %d 个板块资金流点缺少日期", i)
+		}
+		if i > 0 && pt.Date <= sectorFlow.Points[i-1].Date {
+			t.Fatalf("板块资金流日期必须递增：%s 未大于 %s", pt.Date, sectorFlow.Points[i-1].Date)
+		}
+		if v := pt.MainNet; v < -1e13 || v > 1e13 {
+			t.Fatalf("板块 %s 的 mainNet 量级异常（应为元）：%v", pt.Date, v)
+		}
+	}
+
+	// ---------- 5.2 K 线研判：短线/长线双尺度 ----------
+	raw, err = k.CallTool(ctx, "kline.analyze", json.RawMessage(`{"code":"600000","period":"day"}`))
+	if err != nil {
+		t.Fatalf("kline.analyze 调用失败: %v", err)
+	}
+	var analysis struct {
+		Horizons []struct {
+			Key     string    `json:"key"`
+			Title   string    `json:"title"`
+			Window  int       `json:"window"`
+			Bias    string    `json:"bias"`
+			Support []float64 `json:"support"`
+		} `json:"horizons"`
+	}
+	if err := json.Unmarshal(raw, &analysis); err != nil {
+		t.Fatalf("kline.analyze 返回不是合法 JSON: %v", err)
+	}
+	if len(analysis.Horizons) != 2 {
+		t.Fatalf("应返回短线/长线两份研判，实际 %d", len(analysis.Horizons))
+	}
+	for _, h := range analysis.Horizons {
+		if h.Key != "short" && h.Key != "long" {
+			t.Fatalf("horizon.key 非法: %q", h.Key)
+		}
+		if h.Title == "" || h.Window <= 0 {
+			t.Fatalf("%s 研判缺少标题/窗口: %+v", h.Key, h)
+		}
+		if h.Bias != "偏多" && h.Bias != "偏空" && h.Bias != "中性" {
+			t.Fatalf("%s 的 bias 非法: %q", h.Key, h.Bias)
+		}
+	}
+
+	// ---------- 5.3 市场中心：指数/宽度/梯队/龙虎榜 ----------
+	for _, call := range []struct {
+		name    string
+		payload string
+		min     int
+	}{
+		{"market.indices", `{}`, 3},
+		{"market.ladder", `{"limit":5}`, 1},
+		{"market.longhu", `{"limit":5}`, 1},
+		{"market.hot", `{"type":"hour","limit":5}`, 1},
+	} {
+		raw, err = k.CallTool(ctx, call.name, json.RawMessage(call.payload))
+		if err != nil {
+			t.Fatalf("%s 调用失败: %v", call.name, err)
+		}
+		var payload struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("%s 返回不是对象: %v", call.name, err)
+		}
+		if len(payload.Items) < call.min {
+			t.Fatalf("%s 返回 %d 条，至少期望 %d 条", call.name, len(payload.Items), call.min)
+		}
+	}
+	var breadth struct {
+		Up    int `json:"up"`
+		Down  int `json:"down"`
+		Flat  int `json:"flat"`
+		Limit int `json:"limitUp"`
+	}
+	raw, err = k.CallTool(ctx, "market.breadth", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("market.breadth 调用失败: %v", err)
+	}
+	if err := json.Unmarshal(raw, &breadth); err != nil {
+		t.Fatalf("market.breadth 返回不是合法 JSON: %v", err)
+	}
+	if breadth.Up+breadth.Down+breadth.Flat < 1000 {
+		t.Fatalf("涨跌家数合计异常：up=%d down=%d flat=%d", breadth.Up, breadth.Down, breadth.Flat)
+	}
+
+	// ---------- 5.4 分时：当日 241 点 ----------
+	var minute struct {
+		PrevClose float64 `json:"prevClose"`
+		Points    []struct {
+			Time  string  `json:"time"`
+			Price float64 `json:"price"`
+		} `json:"points"`
+	}
+	raw, err = k.CallTool(ctx, "market.minute", json.RawMessage(`{"code":"600000"}`))
+	if err != nil {
+		t.Fatalf("market.minute 调用失败: %v", err)
+	}
+	if err := json.Unmarshal(raw, &minute); err != nil {
+		t.Fatalf("market.minute 返回不是合法 JSON: %v", err)
+	}
+	if minute.PrevClose <= 0 || len(minute.Points) < 60 {
+		t.Fatalf("分时数据不完整：prevClose=%v points=%d", minute.PrevClose, len(minute.Points))
+	}
+	for i, pt := range minute.Points {
+		if pt.Time == "" || pt.Price <= 0 {
+			t.Fatalf("第 %d 个分时点非法: %+v", i, pt)
+		}
+	}
+
 	// ---------- 6. 审计：工具调用必须落库 ----------
 	events, err := k.Audit().List(200)
 	if err != nil {

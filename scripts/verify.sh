@@ -26,15 +26,16 @@ WITH_NETWORK=0
 VERBOSE=0
 KEEP_LOGS=0
 
-# EXPECT_PLUGINS 是"插件装配数下限"，默认按最终验收的 8 个内置插件
-# （watchlist / fundflow / kline / agentlab / knowledge / modelsettings / quant / watch）。
+# EXPECT_PLUGINS 是"插件装配数下限"，默认按最终验收的 11 个内置插件
+# （agentlab / watchlist / marketcenter / fundflow / kline / knowledge / modelsettings / quant / watch / console / fuyao）。
 # 交付中期插件尚未全接线时必然不达标——这是"集成末期生效"的门禁，
 # 需要中期跑绿可以显式传 --expect-plugins=0 关掉该断言。
-EXPECT_PLUGINS=8
+EXPECT_PLUGINS=11
 
-# EXPECT_TOOLS 是"工具索引条数下限"。实测基线：8 个插件 / 27 个工具
-# （lead 报的是 28，实测 27，差 1 已回报待确认）。传 0 关闭该断言；新增工具时同步上调。
-EXPECT_TOOLS=27
+# EXPECT_TOOLS 是"工具索引条数下限"。实测基线：11 个插件 / 61 个工具
+# （本轮新增 plugins/fuyao 的 20 个 fuyao.* 工具；工具名允许 camelCase，索引正则同步放宽）。
+# 传 0 关闭该断言；新增工具时同步上调。
+EXPECT_TOOLS=61
 
 usage() {
   cat <<'USAGE'
@@ -218,7 +219,7 @@ step_headless_tools() {
   go run . --headless --task=tools >"$log" 2>&1
   code=$?
   local count
-  count="$(grep -cE '^[a-z0-9]+(\.[a-z0-9_]+)+ +\[(read|network|write|exec) *\]' "$log" 2>/dev/null || true)"
+  count="$(grep -cE '^[A-Za-z0-9]+(\.[A-Za-z0-9_]+)+ +\[(read|network|write|exec) *\]' "$log" 2>/dev/null || true)"
   count="${count:-0}"
   if [ "$code" -eq 0 ] && [ "$count" -eq 0 ]; then
     {
@@ -248,7 +249,7 @@ step_network_chain() {
   go run . --headless --task=bars -- 600000 day 30 >"$log" 2>&1
   code=$?
   if [ "$code" -eq 0 ]; then
-    # 注意：headless 的 pretty() 会把输出截到 4000 字节，所以这里不能断言"恰好 30 根"。
+    # 注意：headless 的 pretty() 会把输出截到 4000 个字符，所以这里不能断言"恰好 30 根"。
     # 精确条数由 go test -tags live ./test/ -run TestLiveEndToEnd 用 Go API 断言。
     local count
     count="$(grep -cE '^    "date"' "$log" 2>/dev/null || true)"

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +58,8 @@ type Kernel struct {
 	order   []string
 	tools   map[string]plugin.Tool
 	started bool
+	// disabled 是启动时要跳过的插件（来自 settings/plugins.disabled，重启生效）。
+	disabled map[string]bool
 
 	services *plugin.ServiceRegistry
 	events   *plugin.Bus
@@ -83,6 +86,7 @@ func New(opts Options) (*Kernel, error) {
 		log:      opts.Logger,
 		entries:  map[string]*entry{},
 		tools:    map[string]plugin.Tool{},
+		disabled: map[string]bool{},
 		services: plugin.NewServiceRegistry(),
 		events:   plugin.NewBus(),
 	}, nil
@@ -122,20 +126,63 @@ func (k *Kernel) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// 方法控制面必须在插件激活前注册：agentlab 在 Activate 里取用。
+	k.registerMethodControl()
+	active := 0
 	for _, id := range ordered {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// 停用的插件不进激活流程，但保留在 entries/order 里：
+		// PluginView 依旧展示（用户能看到"装了但停着"），只是没有工具/面板/方法贡献。
+		if k.isDisabled(id) {
+			k.markSkipped(id, DisabledReason)
+			continue
+		}
 		k.activate(ctx, id)
 	}
-	active := 0
 	for _, e := range k.snapshot() {
 		if e.active {
 			active++
 		}
 	}
-	k.log.Info("kernel 启动完成", "plugins", len(ids), "active", active, "tools", len(k.Tools()))
+	k.log.Info("kernel 启动完成", "plugins", len(ids), "active", active, "disabled", len(k.Disabled()), "tools", len(k.Tools()))
 	return nil
+}
+
+// SetDisabled 设定启动时要跳过的插件 ID。只允许在 Start 之前调用：
+// 运行时停用会留下悬空贡献（已注册的工具/方法无法安全回收），因此一律重启生效。
+func (k *Kernel) SetDisabled(ids []string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.started {
+		return errors.New("kernel: 已启动，停用变更需重启生效")
+	}
+	k.disabled = make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if v := strings.TrimSpace(id); v != "" {
+			k.disabled[v] = true
+		}
+	}
+	return nil
+}
+
+// Disabled 返回当前已停用的插件 ID（排序后返回，便于前端稳定渲染）。
+func (k *Kernel) Disabled() []string {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	out := make([]string, 0, len(k.disabled))
+	for id := range k.disabled {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (k *Kernel) isDisabled(id string) bool {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.disabled[id]
 }
 
 func (k *Kernel) topoOrder(ids []string) ([]string, error) {
@@ -188,6 +235,10 @@ func (k *Kernel) activate(ctx context.Context, id string) {
 		d := k.entries[dep]
 		k.mu.RUnlock()
 		if d == nil || !d.active {
+			if d != nil && d.skipped && k.isDisabled(dep) {
+				k.markSkipped(id, "依赖已停用: "+dep)
+				return
+			}
 			k.markSkipped(id, "依赖未激活: "+dep)
 			return
 		}
@@ -310,6 +361,7 @@ type PluginView struct {
 	Tags        []string        `json:"tags,omitempty"`
 	Active      bool            `json:"active"`
 	Skipped     bool            `json:"skipped,omitempty"`
+	Disabled    bool            `json:"disabled,omitempty"`
 	Error       string          `json:"error,omitempty"`
 	Tools       []ToolView      `json:"tools"`
 	UI          []plugin.UISlot `json:"ui"`
@@ -322,6 +374,8 @@ type ToolView struct {
 	Summary string   `json:"summary"`
 	Tags    []string `json:"tags,omitempty"`
 	Risk    string   `json:"risk"`
+	// Owner 是贡献该工具的插件 ID，设置中心的「工具」页据此展示来源。
+	Owner string `json:"owner,omitempty"`
 }
 
 type MethodView struct {
@@ -333,6 +387,7 @@ type StatusView struct {
 	Started    bool              `json:"started"`
 	Plugins    int               `json:"plugins"`
 	Active     int               `json:"active"`
+	Disabled   int               `json:"disabled,omitempty"`
 	Tools      int               `json:"tools"`
 	UI         int               `json:"ui"`
 	Services   []string          `json:"services"`
@@ -360,13 +415,18 @@ func (k *Kernel) Plugins() []PluginView {
 			Tags:        e.manifest.Tags,
 			Active:      e.active,
 			Skipped:     e.skipped,
+			Disabled:    k.disabled[id],
 			Error:       e.activateErr,
 		}
+		// tools/ui/methods 一律返回数组（空也要是 []，不要 null），前端可直接 length。
+		v.Tools = make([]ToolView, 0)
+		v.UI = make([]plugin.UISlot, 0)
+		v.Methods = make([]MethodView, 0)
 		if e.ctx != nil {
 			for _, t := range e.ctx.Tools.List() {
-				v.Tools = append(v.Tools, ToolView{Name: t.Name, Title: t.Title, Summary: t.Summary, Tags: t.Tags, Risk: string(t.Risk)})
+				v.Tools = append(v.Tools, ToolView{Name: t.Name, Title: t.Title, Summary: t.Summary, Tags: t.Tags, Risk: string(t.Risk), Owner: t.Owner})
 			}
-			v.UI = e.ctx.UI.List()
+			v.UI = append(v.UI, e.ctx.UI.List()...)
 			for _, m := range e.ctx.Methods.List() {
 				v.Methods = append(v.Methods, MethodView{Name: m.Name, Description: m.Description})
 			}
@@ -427,9 +487,10 @@ func (k *Kernel) Status() StatusView {
 		Started:  k.started,
 		Plugins:  len(k.order),
 		Active:   active,
+		Disabled: len(k.disabled),
 		Tools:    len(k.tools),
 		Policy:   k.opts.Guard.Policy(),
-		Services: k.services.Names(),
+		Services: k.pluginServiceNames(),
 		Time:     k.opts.Clock(),
 	}
 	for _, e := range k.entries {

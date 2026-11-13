@@ -31,13 +31,15 @@ const (
 
 // Source 描述"盯什么"。
 type Source struct {
-	Type    SourceType `json:"type"`
-	Codes   []string   `json:"codes,omitempty"`   // quote/kline 用
-	Sector  string     `json:"sector,omitempty"`  // sector 用（板块或概念名）
-	Kind    string     `json:"kind,omitempty"`    // sector: sector|concept；news: roll|notice
-	Keyword string     `json:"keyword,omitempty"` // news 用
-	Period  string     `json:"period,omitempty"`  // kline 周期，默认 day
-	Times   []string   `json:"times,omitempty"`   // schedule 用，如 ["09:20","14:50"]
+	Type   SourceType `json:"type"`
+	Codes  []string   `json:"codes,omitempty"`  // quote/kline 用
+	Sector string     `json:"sector,omitempty"` // sector 用（板块或概念名）
+	// Kind 是子类型：sector -> sector|concept；news -> roll（财经要闻，默认）| notice/announcement。
+	// 注意 notice 已降级为「新浪滚动新闻 + 关键词过滤」，不再是交易所公告全文（东财公告接口已下线）。
+	Kind    string   `json:"kind,omitempty"`    // sector: sector|concept；news: roll|notice
+	Keyword string   `json:"keyword,omitempty"` // news 用
+	Period  string   `json:"period,omitempty"`  // kline 周期，默认 day
+	Times   []string `json:"times,omitempty"`   // schedule 用，如 ["09:20","14:50"]
 }
 
 // Action 描述条件命中后做什么。

@@ -1,0 +1,12 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-hot",
+  "data": {
+    "timestamp": 1794552927071,
+    "item": [
+      {"thscode":"002086.SZ","ticker":"002086","name":"东方海洋","rank":1,"heat":"5508260","rank_change":3,"rank_trend":"up"},
+      {"thscode":"600410.SH","ticker":"600410","name":"华胜天成","rank":2,"heat":"5102200","rank_change":-1,"rank_trend":"down"}
+    ]
+  }
+}

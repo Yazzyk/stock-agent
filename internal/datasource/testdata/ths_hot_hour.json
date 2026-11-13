@@ -1,0 +1,62 @@
+{
+  "status_code": 0,
+  "data": {
+    "stock_list": [
+      {
+        "market": 17,
+        "code": "600715",
+        "rate": "529823.0",
+        "rise_and_fall": 10.1754,
+        "name": "\u6587\u6295\u63a7\u80a1",
+        "analyse_title": "AI\u6f2b\u5267+\u5267\u96c6\u53d1\u884c+\u5317\u4eac\u56fd\u8d44",
+        "hot_rank_chg": 0,
+        "order": 1,
+        "tag": {
+          "concept_tag": [
+            "\u77ed\u5267\u6e38\u620f",
+            "\u624b\u673a\u6e38\u620f"
+          ],
+          "popularity_tag": "12\u59298\u677f"
+        }
+      },
+      {
+        "market": 33,
+        "code": "000530",
+        "rate": "517287.0",
+        "rise_and_fall": 7.1225,
+        "name": "\u51b0\u5c71\u51b7\u70ed",
+        "analyse_title": null,
+        "hot_rank_chg": 0,
+        "order": 2,
+        "tag": {
+          "live_tag": {
+            "jump_url": "https://med.10jqka.com.cn/frontend/liveshare/#/transferPage?sid=493684&highlight_id=1057296",
+            "anchor": "\u56fd\u878d\u8bc1\u5238\u82cf\u5b66\u9e4f"
+          },
+          "concept_tag": [
+            "\u65e0\u4eba\u96f6\u552e",
+            "\u51b0\u96ea\u4ea7\u4e1a"
+          ],
+          "popularity_tag": "3\u59292\u677f"
+        }
+      },
+      {
+        "market": 17,
+        "code": "600261",
+        "rate": "419814.0",
+        "rise_and_fall": 6.8376,
+        "name": "\u9633\u5149\u7167\u660e",
+        "analyse_title": null,
+        "hot_rank_chg": 0,
+        "order": 3,
+        "tag": {
+          "concept_tag": [
+            "\u9ad8\u80a1\u606f\u7cbe\u9009",
+            "\u8de8\u5883\u7535\u5546"
+          ],
+          "popularity_tag": "\u6301\u7eed\u4e0a\u699c"
+        }
+      }
+    ]
+  }
+}

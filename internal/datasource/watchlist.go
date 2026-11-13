@@ -88,8 +88,11 @@ func (s *Service) SyncTHSWatchlist(ctx context.Context) (contract.SyncResult, er
 		switch {
 		case webErr == nil:
 			groups, source = []thsGroup{web}, "ths-web"
+			s.clearWebLoginInvalid()
 		case errors.Is(webErr, ErrNeedWebLogin):
 			result.NeedWebLogin = true
+			// 记下来：诊断里 web 会显示 no-login，前端就不会对着过期 cookie 反复自动同步。
+			s.markWebLoginInvalid(webErr.Error())
 			result.Warnings = append(result.Warnings, webErr.Error())
 		case webErr != nil:
 			result.Warnings = append(result.Warnings, "同花顺网页端自选读取失败: "+webErr.Error())
@@ -103,6 +106,7 @@ func (s *Service) SyncTHSWatchlist(ctx context.Context) (contract.SyncResult, er
 		} else {
 			result.Success = false
 			result.Message = "没有可同步的自选来源：本机同花顺需要完全磁盘访问权限或登录态，数据目录下也没有 watchlist.json"
+			s.fillSyncCheck(&result)
 			return result, nil
 		}
 	}
@@ -119,6 +123,7 @@ func (s *Service) SyncTHSWatchlist(ctx context.Context) (contract.SyncResult, er
 		result.Message = "自选已解析但保存失败: " + err.Error()
 		result.Groups = groupNames
 		result.Source = source
+		s.fillSyncCheck(&result)
 		return result, nil
 	}
 	result.Success = true
@@ -127,7 +132,19 @@ func (s *Service) SyncTHSWatchlist(ctx context.Context) (contract.SyncResult, er
 	result.Added = added
 	result.Removed = removed
 	result.Message = fmt.Sprintf("已从%s同步 %d 个分组、%d 只标的（新增 %d，移除 %d）", sourceLabel(source), len(groupNames), len(merged), added, removed)
+	s.fillSyncCheck(&result)
 	return result, nil
+}
+
+// fillSyncCheck 把最新前置诊断回填进同步结果：前端据此收起向导、或者告诉用户「还差哪一步」。
+// 诊断只读本地文件、不发网络请求，所以同步结束后再算一次也不会多打请求。
+func (s *Service) fillSyncCheck(result *contract.SyncResult) {
+	check, err := s.SyncCheck(context.Background())
+	if err != nil {
+		s.log.Debug("同步后诊断失败，跳过 Check 回填", "error", err)
+		return
+	}
+	result.Check = &check
 }
 
 func sourceLabel(source string) string {

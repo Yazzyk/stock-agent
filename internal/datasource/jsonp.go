@@ -2,6 +2,7 @@ package datasource
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -67,6 +68,33 @@ func decodeGBK(raw []byte) (string, error) {
 		return "", errors.New("datasource: GBK 解码后不是合法 UTF-8")
 	}
 	return string(decoded), nil
+}
+
+// anyNum 把 JSON 里的数字/字符串数字/"-" 统一成 float64；无法解析一律 0（缺失）。
+// 上游对停牌/无数据的字段会混用数字、"-"、null 三种形态，强类型一崩就是整批失败，
+// 所以解析一律先归一成 any 再取值。
+func anyNum(v any) float64 {
+	switch value := v.(type) {
+	case float64:
+		return value
+	case json.Number:
+		if f, err := value.Float64(); err == nil {
+			return f
+		}
+	case string:
+		if f, ok := parseNum(value); ok {
+			return f
+		}
+	}
+	return 0
+}
+
+// anyStr 取 JSON 字符串值；非字符串返回空串。
+func anyStr(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // splitNonEmpty 按分隔符切分并丢弃空段，便于解析 "a~b~~c" 这类定长字段串。

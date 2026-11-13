@@ -105,15 +105,16 @@ export function activateByIndex(index: number): void {
   if (target) activate(target.id)
 }
 
-/** 全局搜索选中标的：记录焦点，并尽量切到 K 线面板。 */
-export function focusStock(code: string, name: string): void {
+/** 全局搜索/行内联动定位标的：记录焦点并尽量切到 K 线面板；silent 时不弹 toast（行内跳转用）。 */
+export function focusStock(code: string, name: string, opts: { silent?: boolean } = {}): void {
   state.focus = { code, name }
   const kline = state.slots.find((s) => s.component === 'kline')
   if (kline) activate(kline.id)
-  toast('已定位 ' + code + ' ' + name, 'ok')
+  if (!opts.silent) toast('已定位 ' + code + ' ' + name, 'ok')
 }
 
-async function loadDefaultModel(): Promise<void> {
+/** 读取全局默认模型并更新状态栏（模型设置页改完默认后调用）。 */
+export async function refreshDefaultModel(): Promise<void> {
   try {
     const res = await invoke<{ providers?: unknown[]; defaultId?: string }>('modelsettings', 'list', {})
     const list = Array.isArray(res?.providers) ? res.providers : []
@@ -156,7 +157,7 @@ export async function boot(): Promise<void> {
     if (!state.activeId) state.activeId = slots[0]?.id ?? ''
     state.ready = true
     state.error = ''
-    await loadDefaultModel()
+    await refreshDefaultModel()
     if (state.demo) toast('演示数据模式：未检测到桌面内核，展示的是内置样例', 'warn')
   } catch (e) {
     state.error = friendlyError(e, '初始化界面')

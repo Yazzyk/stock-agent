@@ -106,6 +106,24 @@ func New(cfg Config, logger *slog.Logger) (*kernel.Kernel, error) {
 	if err := k.Services().Register("llm", llmSvc); err != nil {
 		return nil, fmt.Errorf("bootstrap: 注册 llm 服务失败: %w", err)
 	}
+	// 数据服务同时作为 "datasource" 暴露：设置中心据此配置官方金融数据 API。
+	if err := k.Services().Register("datasource", data); err != nil {
+		return nil, fmt.Errorf("bootstrap: 注册 datasource 服务失败: %w", err)
+	}
+
+	// 插件启停：先按 settings/plugins.disabled 标记（必须在 Start 之前），
+	// 再把总览服务注册给设置中心插件。
+	disabled := loadDisabledPlugins(store, logger)
+	if err := k.SetDisabled(disabled); err != nil {
+		return nil, fmt.Errorf("bootstrap: 应用插件停用配置失败: %w", err)
+	}
+	if len(disabled) > 0 {
+		logger.Info("已停用插件（重启生效）", "disabled", disabled)
+	}
+	if err := k.Services().Register(inventoryServiceName, newKernelInventory(k, store, logger, disabled)); err != nil {
+		return nil, fmt.Errorf("bootstrap: 注册设置中心服务失败: %w", err)
+	}
+
 	for _, p := range pluginsall.All() {
 		if err := k.Register(p); err != nil {
 			return nil, fmt.Errorf("bootstrap: 注册插件失败: %w", err)

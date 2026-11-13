@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -186,8 +187,16 @@ func TestRuntimeRunPersistsSessionAndEmitsEvents(t *testing.T) {
 			t.Fatalf("事件序号必须从 1 递增，实际第 %d 条 seq=%d", i, e.Seq)
 		}
 	}
-	if detail.Events[0].Kind != EventUser {
-		t.Fatalf("首条事件应为 user，实际 %s", detail.Events[0].Kind)
+	// 第一条事件必须是 system（完整 system prompt），第二条才是 user：
+	// 轨迹要能审计"模型到底收到了什么口径"，而不是只有上下文里的 systemTokens 数字。
+	if detail.Events[0].Kind != EventSystem {
+		t.Fatalf("首条事件应为 system，实际 %s", detail.Events[0].Kind)
+	}
+	if detail.Events[0].Content == "" || !strings.Contains(detail.Events[0].Content, "三级披露协议") {
+		t.Fatalf("system 事件必须落完整系统提示词，实际前 40 字: %q", truncateRunes(detail.Events[0].Content, 40))
+	}
+	if detail.Events[1].Kind != EventUser {
+		t.Fatalf("第二条事件应为 user，实际 %s", detail.Events[1].Kind)
 	}
 	last := detail.Events[len(detail.Events)-1]
 	if last.Kind != EventReport {
@@ -432,6 +441,8 @@ func TestSteerInjectedBeforeNextModelCall(t *testing.T) {
 	}
 
 	// 事件：agent.steer 恰好一次，payload 固定 {sessionId,text,queued}
+	// plugin.Bus.Publish 是异步广播，Run 返回不代表订阅者已收完，先等事件落地。
+	waitForTopic(t, sink, "agent.steer")
 	steers := sink.byTopic("agent.steer")
 	if len(steers) != 1 {
 		t.Fatalf("agent.steer 事件应恰好 1 条，实际 %d", len(steers))
@@ -625,5 +636,229 @@ func TestSessionStoreReplayIsAppendOnly(t *testing.T) {
 	}
 	if _, err := s.Get("nope"); err == nil {
 		t.Fatal("不存在的会话应报错")
+	}
+}
+
+// recordingLLM 在 fakeLLM 之上记录完整请求（fakeLLM.seen 只保存 messages），
+// 用来断言收口调用是否带了工具清单。
+type recordingLLM struct {
+	*fakeLLM
+	mu   sync.Mutex
+	reqs []contract.ChatRequest
+}
+
+// record 保存一次完整请求。
+func (r *recordingLLM) record(req contract.ChatRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reqs = append(r.reqs, req)
+}
+
+// Chat 记录请求并委托给脚本回放。
+func (r *recordingLLM) Chat(ctx context.Context, req contract.ChatRequest) (contract.Reply, error) {
+	r.record(req)
+	return r.fakeLLM.Chat(ctx, req)
+}
+
+// Stream 与 Chat 同口径，只在成功且有正文时回调增量。
+func (r *recordingLLM) Stream(ctx context.Context, req contract.ChatRequest, onDelta func(string)) (contract.Reply, error) {
+	r.record(req)
+	reply, err := r.fakeLLM.Chat(ctx, req)
+	if err != nil {
+		return contract.Reply{}, err
+	}
+	if onDelta != nil && strings.TrimSpace(reply.Message.Content) != "" {
+		onDelta(reply.Message.Content)
+	}
+	return reply, nil
+}
+
+// lastRequest 返回最近一次完整请求。
+func (r *recordingLLM) lastRequest() contract.ChatRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.reqs) == 0 {
+		return contract.ChatRequest{}
+	}
+	return r.reqs[len(r.reqs)-1]
+}
+
+// finalizeFailLLM 在第 failFrom 次调用起返回错误，用来测收口调用失败时保留原结果。
+type finalizeFailLLM struct {
+	*fakeLLM
+	mu       sync.Mutex
+	n        int
+	failFrom int
+}
+
+// Chat 前 failFrom-1 次走脚本，之后返回错误（模拟收口调用失败）。
+func (f *finalizeFailLLM) Chat(ctx context.Context, req contract.ChatRequest) (contract.Reply, error) {
+	f.mu.Lock()
+	f.n++
+	n := f.n
+	f.mu.Unlock()
+	if n >= f.failFrom {
+		return contract.Reply{}, errors.New("收口调用失败（测试注入）")
+	}
+	return f.fakeLLM.Chat(ctx, req)
+}
+
+// Stream 与 Chat 保持同样的错误注入（runtime 有 OnDelta 时走 Stream）。
+func (f *finalizeFailLLM) Stream(ctx context.Context, req contract.ChatRequest, onDelta func(string)) (contract.Reply, error) {
+	reply, err := f.Chat(ctx, req)
+	if err != nil {
+		return contract.Reply{}, err
+	}
+	if onDelta != nil && strings.TrimSpace(reply.Message.Content) != "" {
+		onDelta(reply.Message.Content)
+	}
+	return reply, nil
+}
+
+// count 返回已发生的模型调用次数。
+func (f *finalizeFailLLM) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n
+}
+
+// 预算耗尽后应再发一次不带工具的收口调用，报告里既有结论也有停机说明。
+func TestRuntimeBudgetExhaustionProducesFinalizedReport(t *testing.T) {
+	conclusion := "## 结论\n600000 现价 12.34，短线偏强。\n## 依据\n- market.quote 返回 12.34\n## 不确定性\n- 只有一个快照点位\n## 风险提示\n- 不构成投资建议"
+	llm := &recordingLLM{fakeLLM: &fakeLLM{script: []contract.Message{
+		asstToolCall("c1", "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+		asstToolCall("c2", "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+		{Role: contract.RoleAssistant, Content: conclusion},
+	}}}
+	rt, _, _, _ := newTestRuntime(t, llm, func(o *RuntimeOptions) {
+		o.Policy.MaxToolCalls = 10
+		o.Policy.MaxTokensPerRun = 150
+	})
+
+	rep, err := rt.Run(context.Background(), "chat", "解释一下量比口径", "")
+	if err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+	if len(llm.seen) != 3 {
+		t.Fatalf("预算耗尽后应追加一次收口调用（共 3 次），实际 %d 次", len(llm.seen))
+	}
+	last := llm.lastRequest()
+	if len(last.Tools) != 0 {
+		t.Fatalf("收口调用必须不带工具，实际带 %d 个", len(last.Tools))
+	}
+	lastText := messagesText(last.Messages)
+	if !strings.Contains(lastText, "最终报告") || !strings.Contains(lastText, "不能再调用任何工具") {
+		t.Fatalf("收口调用应带明确的收口指令，实际: %.300s", lastText)
+	}
+	if !strings.Contains(lastText, "market.quote") || !strings.Contains(lastText, "12.34") {
+		t.Fatalf("收口调用应带上已获得的工具结果，实际: %.300s", lastText)
+	}
+	if !strings.Contains(rep.Report, "## 结论") || !strings.Contains(rep.Report, "短线偏强") {
+		t.Fatalf("报告正文应包含收口结论，实际: %q", rep.Report)
+	}
+	if !strings.Contains(rep.Report, "已停机") || !strings.Contains(rep.Report, "token 预算耗尽") {
+		t.Fatalf("报告应保留可读的停机说明，实际: %q", rep.Report)
+	}
+	if rep.Usage.TotalTokens != 300 {
+		t.Fatalf("收口调用的 token 应计入总量（100×3），实际 %d", rep.Usage.TotalTokens)
+	}
+	if rep.Error != "" {
+		t.Fatalf("收口成功时不应有错误: %s", rep.Error)
+	}
+}
+
+// 收口调用失败时不能吞掉原结果：停机说明仍在，token 也不虚增。
+func TestRuntimeBudgetFinalizeFailureKeepsPartialResult(t *testing.T) {
+	base := &fakeLLM{script: []contract.Message{
+		asstToolCall("c1", "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+		asstToolCall("c2", "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+	}}
+	llm := &finalizeFailLLM{fakeLLM: base, failFrom: 3}
+	rt, _, _, _ := newTestRuntime(t, llm, func(o *RuntimeOptions) {
+		o.Policy.MaxToolCalls = 10
+		o.Policy.MaxTokensPerRun = 150
+	})
+
+	rep, err := rt.Run(context.Background(), "chat", "收口失败场景", "")
+	if err != nil {
+		t.Fatalf("收口失败不应让整轮 Run 报错: %v", err)
+	}
+	if llm.count() != 3 {
+		t.Fatalf("收口调用确实发生过（共 3 次），实际 %d 次", llm.count())
+	}
+	if rep.Error != "" {
+		t.Fatalf("收口失败已是降级路径，不应写入 Report.Error: %s", rep.Error)
+	}
+	if !strings.Contains(rep.Report, "已停机") || !strings.Contains(rep.Report, "token 预算耗尽") {
+		t.Fatalf("收口失败时仍要给出停机说明，实际: %q", rep.Report)
+	}
+	if rep.Usage.TotalTokens != 200 {
+		t.Fatalf("失败的收口调用不应计 token，实际 %d", rep.Usage.TotalTokens)
+	}
+}
+
+// Token 不设预算上限（Policy.MaxTokensPerRun=0）：
+// 累计用量远超旧的隐式默认（60k）也必须跑完脚本，不得出现「预算耗尽」停机。
+func TestRuntimeTokenBudgetUnlimitedByDefault(t *testing.T) {
+	llm := &fakeLLM{
+		usage: &contract.Usage{PromptTokens: 180000, CompletionTokens: 20000, TotalTokens: 200000},
+		script: []contract.Message{
+			asstToolCall("c1", "tool.call", `{"name":"market.quote","args":{"codes":["600000"]}}`),
+			{Role: contract.RoleAssistant, Content: "## 结论\n不设预算上限时正常收口。\n## 依据\n- market.quote\n## 不确定性\n- 无\n## 风险提示\n- 仅研究参考"},
+		},
+	}
+	rt, _, _, _ := newTestRuntime(t, llm, func(o *RuntimeOptions) {
+		o.Policy.MaxToolCalls = 6
+		o.Policy.MaxTokensPerRun = 0
+	})
+
+	rep, err := rt.Run(context.Background(), "chat", "长任务不设预算", "")
+	if err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+	if rep.Steps != 2 {
+		t.Fatalf("不设预算时应跑完脚本（2 步），实际 %d 步", rep.Steps)
+	}
+	if strings.Contains(rep.Report, "预算耗尽") || strings.Contains(rep.Report, "已停机") {
+		t.Fatalf("不设预算上限时不应出现预算停机说明: %q", rep.Report)
+	}
+	if rep.Usage.TotalTokens != 400000 {
+		t.Fatalf("两次调用的 token 都应计入（200k×2），实际 %d", rep.Usage.TotalTokens)
+	}
+}
+
+// 步数上限同样要收口；收口调用不增加 Steps，也不带工具。
+func TestReactStepExhaustionFinalizesWithoutCountingStep(t *testing.T) {
+	host := testHost()
+	gw := progressive.NewGateway(host, nil, nil, plugin.RiskNetwork)
+	llm := &recordingLLM{fakeLLM: &fakeLLM{script: []contract.Message{
+		asstToolCall("c1", "tool.search", `{"query":"quote"}`),
+		{Role: contract.RoleAssistant, Content: "## 结论\n步数用尽，先给出已有结论。\n## 依据\n- tool.search\n## 不确定性\n- 未展开细节\n## 风险提示\n- 仅作研究参考"},
+	}}}
+	run, err := buildReact(context.Background(), reactConfig{LLM: llm, Gateway: gw, MaxSteps: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := run.Run(context.Background(), "步数上限收口测试")
+	if err != nil {
+		t.Fatalf("步数上限应优雅收尾: %v", err)
+	}
+	if !res.Exhausted || res.ExhaustKind != "steps" {
+		t.Fatalf("应标记步数停机，实际 exhausted=%v kind=%q", res.Exhausted, res.ExhaustKind)
+	}
+	if !res.Finalized {
+		t.Fatal("步数耗尽后也应完成收口调用")
+	}
+	if res.Steps != 1 {
+		t.Fatalf("收口调用不计入 Steps，期望 1，实际 %d", res.Steps)
+	}
+	if !strings.Contains(res.Content, "## 结论") {
+		t.Fatalf("收口结论应成为最终内容，实际: %q", res.Content)
+	}
+	if len(llm.seen) != 2 {
+		t.Fatalf("应有且仅有一次收口调用（共 2 次），实际 %d 次", len(llm.seen))
+	}
+	if len(llm.lastRequest().Tools) != 0 {
+		t.Fatalf("收口调用必须不带工具，实际带 %d 个", len(llm.lastRequest().Tools))
 	}
 }

@@ -46,10 +46,10 @@ func (s *Service) thsCookie() string {
 	if v := strings.TrimSpace(os.Getenv(thsCookieEnv)); v != "" {
 		return v
 	}
-	if s.dir == "" {
+	path := s.thsCookiePath()
+	if path == "" {
 		return ""
 	}
-	path := filepath.Join(s.dir, thsCookieFile)
 	if s.cfg.Guard != nil {
 		if err := s.cfg.Guard.CheckPath(path); err != nil {
 			s.log.Debug("cookie 文件路径不在允许目录内", "path", path, "error", err)
@@ -61,6 +61,14 @@ func (s *Service) thsCookie() string {
 		return ""
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+// thsCookiePath 返回登录态文件路径 <DataDir>/ths_cookie.txt；未配置数据目录时为空串。
+func (s *Service) thsCookiePath() string {
+	if s.dir == "" {
+		return ""
+	}
+	return filepath.Join(s.dir, thsCookieFile)
 }
 
 // thsWebGroups 用网页端登录态拉默认自选分组。

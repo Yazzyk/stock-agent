@@ -7,6 +7,7 @@ export namespace contract {
 	    maxReqPerMin: number;
 	    maxToolCalls: number;
 	    maxTokensPerRun: number;
+	    allowMethodControl: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new Policy(source);
@@ -20,6 +21,7 @@ export namespace contract {
 	        this.maxReqPerMin = source["maxReqPerMin"];
 	        this.maxToolCalls = source["maxToolCalls"];
 	        this.maxTokensPerRun = source["maxTokensPerRun"];
+	        this.allowMethodControl = source["allowMethodControl"];
 	    }
 	}
 
@@ -47,6 +49,7 @@ export namespace kernel {
 	    summary: string;
 	    tags?: string[];
 	    risk: string;
+	    owner?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ToolView(source);
@@ -59,6 +62,7 @@ export namespace kernel {
 	        this.summary = source["summary"];
 	        this.tags = source["tags"];
 	        this.risk = source["risk"];
+	        this.owner = source["owner"];
 	    }
 	}
 	export class PluginView {
@@ -71,6 +75,7 @@ export namespace kernel {
 	    tags?: string[];
 	    active: boolean;
 	    skipped?: boolean;
+	    disabled?: boolean;
 	    error?: string;
 	    tools: ToolView[];
 	    ui: plugin.UISlot[];
@@ -91,6 +96,7 @@ export namespace kernel {
 	        this.tags = source["tags"];
 	        this.active = source["active"];
 	        this.skipped = source["skipped"];
+	        this.disabled = source["disabled"];
 	        this.error = source["error"];
 	        this.tools = this.convertValues(source["tools"], ToolView);
 	        this.ui = this.convertValues(source["ui"], plugin.UISlot);
@@ -119,6 +125,7 @@ export namespace kernel {
 	    started: boolean;
 	    plugins: number;
 	    active: number;
+	    disabled?: number;
 	    tools: number;
 	    ui: number;
 	    services: string[];
@@ -136,6 +143,7 @@ export namespace kernel {
 	        this.started = source["started"];
 	        this.plugins = source["plugins"];
 	        this.active = source["active"];
+	        this.disabled = source["disabled"];
 	        this.tools = source["tools"];
 	        this.ui = source["ui"];
 	        this.services = source["services"];

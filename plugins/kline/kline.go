@@ -1,8 +1,12 @@
 // Package kline 提供 K 线面板与技术分析：K 线序列、均线、形态、支撑阻力与多空解读。
 //
-// 复权诚实原则：只有东财能提供真复权序列，同花顺 v6 line 是不复权。
-// 因此请求 qfq/hfq 而数据层拿不到时，本插件会降级为不复权并在返回体里写
-// adjust="none" 与 warning，让面板显式标注「不复权」——绝不拿不复权数据冒充前复权去算结论。
+// 复权诚实原则：技术研判应基于**前复权**价（除权跳空不是趋势），因此 Analyze 固定请求 qfq。
+// 数据层 qfq 与 hfq 都由腾讯 fqkline 提供（qfqday / hfqday 两套键），任一口径不可用时
+// 返回 datasource.ErrAdjustUnsupported；那时本插件降级为不复权并在返回体里写 adjust="none" 与
+// warning，让面板显式标注口径——绝不拿不复权数据冒充前复权去算结论。
+//
+// 注意：数据层 adj=none 是「腾讯原始序列 → 新浪日线 → 同花顺兜底」，
+// 只有最后兜底（同花顺 v6 line 实测是前复权）才会出现口径降级，正常路径拿到的是真不复权。
 //
 // 同时通过 Services.Register("kline.engine") 暴露引擎，供其它插件复用同一套指标口径。
 package kline
@@ -55,8 +59,8 @@ func (p *Plugin) Manifest() plugin.Manifest {
 		Description: "K 线与技术指标、形态识别、支撑阻力与多空解读（只读）",
 		Tags:        []string{"market", "quant"},
 		Provides: []string{
-			"method:bars", "method:analyze",
-			"tool:market.bars", "tool:kline.analyze",
+			"method:bars", "method:analyze", "method:minute",
+			"tool:market.bars", "tool:kline.analyze", "tool:market.minute",
 			"service:" + serviceName,
 			"ui:kline",
 		},
@@ -71,6 +75,7 @@ func (p *Plugin) Activate(ctx *plugin.Context) error {
 	methods := []plugin.Method{
 		{Name: "bars", Description: "K 线序列与均线", Fn: p.methodBars},
 		{Name: "analyze", Description: "技术分析与形态识别", Fn: p.methodAnalyze},
+		{Name: "minute", Description: "当日分时走势与均价", Fn: p.methodMinute},
 	}
 	for _, m := range methods {
 		if err := ctx.Methods.Add(m); err != nil {
@@ -91,7 +96,7 @@ func (p *Plugin) Activate(ctx *plugin.Context) error {
 					"code":{"type":"string","minLength":1,"description":"股票代码，如 600000"},
 					"period":{"type":"string","enum":["day","week","month","min60"],"description":"周期，默认 day"},
 					"limit":{"type":"integer","minimum":1,"maximum":250,"description":"返回根数，默认 120"},
-					"adjust":{"type":"string","enum":["","qfq","hfq"],"description":"复权：空=不复权（默认，可靠）、qfq/hfq 依赖东财"}
+					"adjust":{"type":"string","enum":["","qfq","hfq"],"description":"复权：空=不复权（默认）、qfq 前复权、hfq 后复权（均来自腾讯 fqkline）"}
 				},
 				"required":["code"],
 				"additionalProperties":false
@@ -115,6 +120,22 @@ func (p *Plugin) Activate(ctx *plugin.Context) error {
 			}`),
 			Run: p.toolAnalyze,
 		},
+		{
+			Name:    "market.minute",
+			Title:   "分时走势",
+			Summary: "看个股当日分时走势与均价，判断盘中强弱时用",
+			Tags:    []string{"market"},
+			Risk:    plugin.RiskNetwork,
+			Schema: json.RawMessage(`{
+				"type":"object",
+				"properties":{
+					"code":{"type":"string","minLength":1,"description":"股票代码，如 600000"}
+				},
+				"required":["code"],
+				"additionalProperties":false
+			}`),
+			Run: p.toolMinute,
+		},
 	}
 	for _, t := range tools {
 		if err := ctx.Tools.Add(t); err != nil {
@@ -129,7 +150,7 @@ func (p *Plugin) Activate(ctx *plugin.Context) error {
 	return ctx.UI.Add(plugin.UISlot{
 		ID:        "kline",
 		Title:     "K线分析",
-		Icon:      "chart",
+		Icon:      "candles",
 		Group:     "行情",
 		Component: "kline",
 		Order:     30,
@@ -155,17 +176,19 @@ type BarsReply struct {
 }
 
 // AnalyzeReply 是 analyze 方法的返回体。
+// 顶层 summary/patterns/support/resistance 保留给旧调用方；Horizons 是短线/长线双尺度增量字段。
 type AnalyzeReply struct {
-	Code       string           `json:"code"`
-	Name       string           `json:"name"`
-	Period     string           `json:"period"`
-	Adjust     string           `json:"adjust"`
-	Warning    string           `json:"warning,omitempty"`
-	Last       contract.Bar     `json:"last"`
-	Summary    market.Summary   `json:"summary"`
-	Patterns   []market.Pattern `json:"patterns"`
-	Support    []float64        `json:"support"`
-	Resistance []float64        `json:"resistance"`
+	Code       string                   `json:"code"`
+	Name       string                   `json:"name"`
+	Period     string                   `json:"period"`
+	Adjust     string                   `json:"adjust"`
+	Warning    string                   `json:"warning,omitempty"`
+	Last       contract.Bar             `json:"last"`
+	Summary    market.Summary           `json:"summary"`
+	Patterns   []market.Pattern         `json:"patterns"`
+	Support    []float64                `json:"support"`
+	Resistance []float64                `json:"resistance"`
+	Horizons   []market.HorizonAnalysis `json:"horizons"`
 }
 
 type barsArgs struct {
@@ -178,6 +201,16 @@ type barsArgs struct {
 type analyzeArgs struct {
 	Code   string          `json:"code"`
 	Period contract.Period `json:"period"`
+}
+
+// minuteService 是数据层的可选扩展（结构化断言）：提供当日分时序列。
+// 与 fundflow 的可选接口一致，不扩大 contract.DataService，避免所有 stub 连锁改动。
+type minuteService interface {
+	Minute(ctx context.Context, code string) (contract.MinuteSeries, error)
+}
+
+type minuteArgs struct {
+	Code string `json:"code"`
 }
 
 func (p *Plugin) methodBars(ctx context.Context, payload json.RawMessage) (any, error) {
@@ -216,6 +249,27 @@ func (p *Plugin) methodAnalyze(ctx context.Context, payload json.RawMessage) (an
 	return p.engine.Analyze(ctx, code, normalizePeriod(args.Period))
 }
 
+// methodMinute 返回个股/指数当日分时序列（价格、均价、分钟量/额）。
+func (p *Plugin) methodMinute(ctx context.Context, payload json.RawMessage) (any, error) {
+	var args minuteArgs
+	if err := decodeArgs(payload, &args); err != nil {
+		return nil, err
+	}
+	code := strings.TrimSpace(args.Code)
+	if code == "" {
+		return nil, fmt.Errorf("code 不能为空")
+	}
+	service, ok := p.ctx.Data.(minuteService)
+	if !ok {
+		return nil, fmt.Errorf("当前数据层不支持分时走势（datasource 版本不匹配），请升级应用后重试")
+	}
+	series, err := service.Minute(ctx, code)
+	if err != nil {
+		return nil, fmt.Errorf("取 %s 分时失败: %w", code, err)
+	}
+	return series, nil
+}
+
 // Bars 取 K 线并算均线；复权拿不到时降级为不复权并带 warning。
 func (e *Engine) Bars(ctx context.Context, code string, period contract.Period, limit int, adjust contract.Adjust) (BarsReply, error) {
 	reply := BarsReply{Code: code, Period: string(period), Adjust: adjustLabel(adjust)}
@@ -238,8 +292,21 @@ func (e *Engine) Bars(ctx context.Context, code string, period contract.Period, 
 }
 
 // Analyze 汇总技术分析；逻辑与口径全部在 internal/market（纯函数、可单测）。
+//
+// 口径：优先前复权（除权跳空会让均线/形态/支撑阻力全错），拿不到时按 ErrAdjustUnsupported
+// 降级为不复权并带 warning，reply.Adjust 如实反映**实际**用的口径（qfq / none）。
 func (e *Engine) Analyze(ctx context.Context, code string, period contract.Period) (AnalyzeReply, error) {
-	bars, err := e.data.Bars(ctx, code, period, analyzeBarsLimit, contract.AdjustNone)
+	adjust := contract.AdjustQfq
+	bars, err := e.data.Bars(ctx, code, period, analyzeBarsLimit, adjust)
+	warning := ""
+	if err != nil && errors.Is(err, datasource.ErrAdjustUnsupported) {
+		// 明确降级：不复权 + warning，绝不冒充前复权
+		adjust = contract.AdjustNone
+		bars, err = e.data.Bars(ctx, code, period, analyzeBarsLimit, adjust)
+		if err == nil {
+			warning = warningNoAdjustment
+		}
+	}
 	if err != nil {
 		return AnalyzeReply{}, fmt.Errorf("取 %s K 线失败: %w", code, err)
 	}
@@ -251,12 +318,14 @@ func (e *Engine) Analyze(ctx context.Context, code string, period contract.Perio
 		Code:       code,
 		Name:       e.nameOf(ctx, code),
 		Period:     string(period),
-		Adjust:     adjustNoneLabel,
+		Adjust:     adjustLabel(adjust),
+		Warning:    warning,
 		Last:       analysis.Last,
 		Summary:    analysis.Summary,
 		Patterns:   analysis.Patterns,
 		Support:    analysis.Support,
 		Resistance: analysis.Resistance,
+		Horizons:   market.AnalyzeHorizons(bars),
 	}, nil
 }
 
@@ -287,6 +356,11 @@ func (p *Plugin) toolBars(ctx context.Context, payload json.RawMessage) (any, er
 
 func (p *Plugin) toolAnalyze(ctx context.Context, payload json.RawMessage) (any, error) {
 	return p.methodAnalyze(ctx, payload)
+}
+
+// toolMinute 与 methodMinute 同源：Agent 直接拿分时序列做盘中强弱判断。
+func (p *Plugin) toolMinute(ctx context.Context, payload json.RawMessage) (any, error) {
+	return p.methodMinute(ctx, payload)
 }
 
 func normalizePeriod(period contract.Period) contract.Period {

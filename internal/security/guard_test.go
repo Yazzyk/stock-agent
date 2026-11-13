@@ -13,7 +13,7 @@ import (
 
 func testPolicy() contract.Policy {
 	return contract.Policy{
-		NetworkAllowlist: []string{"10jqka.com.cn", "*.eastmoney.com", "gtimg.cn", "deepseek.com"},
+		NetworkAllowlist: []string{"10jqka.com.cn", "*.sinajs.cn", "gtimg.cn", "deepseek.com"},
 		AllowExec:        false,
 		MaxReqPerMin:     60,
 		MaxToolCalls:     24,
@@ -29,17 +29,19 @@ func TestAllowHost(t *testing.T) {
 		want bool
 	}{
 		{"精确命中", "gtimg.cn", true},
-		{"子域命中", "push2.eastmoney.com", true},
-		{"通配符规则命中", "data.eastmoney.com", true},
-		{"带端口", "EASTMONEY.COM:443", true},
+		{"子域命中", "vip.stock.sinajs.cn", true},
+		{"通配符规则命中", "hq.sinajs.cn", true},
+		{"带端口", "SINAJS.CN:443", true},
 		{"带协议与路径", "https://d.10jqka.com.cn/v6/line/hs_600000/01/last.js", true},
 		{"大小写不敏感", "API.DeepSeek.com", true},
 		{"未授权域", "evil.com", false},
-		{"后缀伪装", "eastmoney.com.evil.com", false},
-		{"无点拼接伪装", "noteastmoney.com", false},
-		{"端口后接垃圾", "eastmoney.com:443.evil.com", false},
-		{"端口非数字", "push2.eastmoney.com:abc", false},
-		{"带引号注入", "\"eastmoney.com\"", false},
+		{"后缀伪装", "sinajs.cn.evil.com", false},
+		{"无点拼接伪装", "notsinajs.cn", false},
+		{"端口后接垃圾", "sinajs.cn:443.evil.com", false},
+		{"端口非数字", "hq.sinajs.cn:abc", false},
+		{"带引号注入", "\"sinajs.cn\"", false},
+		// 东财已从数据层移除：即使有人把它写回白名单条目之外，也不应命中。
+		{"已下线的东财主机", "push2.eastmoney.com", false},
 		{"空主机", "   ", false},
 		{"只有路径", "/api/qt/stock", false},
 	}

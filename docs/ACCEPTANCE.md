@@ -3,6 +3,8 @@
 版本：v1.0 · 2026-11-10 · 维护：product · 执行：qa
 对应任务台账 R1–R9。每条给出 Given / When / Then、可执行命令、期望输出。
 
+> **现状说明（2026-11-12）**：本文件是验收历史记录，每条的「通过 / 不通过」都按当时口径保留，**不改写历史结论**。此后有三处变化：① 数据层已彻底移除东方财富（无 eastmoney 代码与请求，白名单也删除了 eastmoney.com），现只有同花顺 / 腾讯 / 新浪；② Token 默认不设预算上限（`MaxTokensPerRun=0`），停机只由工具调用步数与模型单次输出上限决定；③ Agent 工作台的上下文与编队 UI 已按 dsh-context 重做。文中提到的东财端点、东财主源/兜底链路与东财登录态（`emCookie*`）均属历史记录，不代表当前行为。
+
 ## 0. 怎么用
 
 1. 在仓库根目录执行（除标注 `cd frontend` 的命令）。
@@ -225,9 +227,9 @@ ls ~/.guanlan/runs/$(date +%F)/
 |---|---|
 | 归属 | backend-core |
 | 状态 | 交付中 |
-| Given | `content/skills/` 6 个技能、`content/kb/` 10 篇已就位 |
+| Given | `content/skills/` 10 个技能、`content/kb/` 10 篇已就位 |
 | When | 拉工具索引、技能列表、知识库检索 |
-| Then | 工具 ≥ 12 个且 summary ≤ 40 字；技能 6 个且 description ≤ 60 字；检索命中带片段 |
+| Then | 工具 ≥ 12 个且 summary ≤ 40 字；技能 10 个且 description ≤ 60 字；检索命中带片段 |
 
 ```sh
 go run . --headless --task=tools
@@ -249,7 +251,7 @@ market.bars                  [network] 取日/周/月/分钟 K 线，需显式�
 
 - 工具总数 ≥ 12；
 - 每行含 `[risk]`，risk 只出现 `read`/`network`/`write`（**出现 `exec` 直接 FAIL**，违反红线）；
-- `skill.list` 返回 6 个技能，name 为 `premarket-plan / postmarket-review / intraday-monitor / kline-reading / fundflow-reading / quant-honesty`；
+- `skill.list` 返回 10 个技能，包含 `premarket-plan / postmarket-review / intraday-monitor / kline-reading / fundflow-reading / quant-honesty` 与导入的 `champion-limitup-playbook / ultra-short-trading / youzi-tracker / humanizer-zh`；
 - `kb.search` 返回结果含标题与片段，且引用文件路径在 `content/kb/` 下。
 
 frontmatter 解析自检（product 侧已跑通，qa 可复核）：
@@ -430,6 +432,23 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 
 ---
 
+## R11 体验与能力迭代（2026-11，10 项）
+
+| # | 验收项 | 证据 | 结论 |
+|---|---|---|---|
+| R11.1 | 同步自动化 | 打开自选自动 `check`；未就绪显示 4 步向导（local/web-login/web-capture/manual），`open-settings` 深链、`open-url` 登录页、`capture-cookie`/粘贴、`copy` 数据目录；授权后 2s×60 轮询并自动 `sync` | PASS（演示模式 + 单测 `TestSyncCheck*`） |
+| R11.2 | 个股资金流进自选 | 自选列主力净额/主力占比/5日主力 + sparkline；行内「资金」抽屉（五项指标 + 多日双轴图 + 摘要）；资金流面板标的卡 + 排名 | PASS（1280×800 截图 + `flowhistory_test`） |
+| R11.3 | K 线对齐 go-stock + 自选跳转 | 周期/指标/自选 chips/OHLC 读数条/十字光标/锚点缩放/拖拽/键盘/研判折叠；自选行「K线」写入 focus 并立即加载 | PASS（截图 + `vue-tsc`） |
+| R11.4 | 盘前/盘中/复盘自动触发 + 提示词可调 | 三张值班卡（开关/倒计时/上次结果/频率/立即运行/编辑提示词模态）；调度器 20s tick、当天去重、单飞、无模型不触发；模板持久化 `agent_templates` | PASS（`template_test`/`schedule_test` + 截图） |
+| R11.5 | 量化 K 线修复 + 可搜索选股 | StockPicker（自选优先 + 全市场防抖）；K 线 + 买卖标记 + 净值双段图，canvas 尺寸/图例/ResizeObserver 修复 | PASS（`vue-tsc` + 截图） |
+| R11.6 | 模型预设下拉 + 官方默认 | provider 卡片 → 模型下拉（上下文/输出）→ 自动填 baseUrl/maxTokens/contextWindow；DeepSeek 1M/384K/8192；legacy 标记；maxTokens 上限按模型 maxOutput | PASS（`presets_test`/`presets_json_test` + 截图） |
+| R11.7 | 插件安装/激活设置页 | console 五标签；插件状态/依赖/工具数/开关；停用写盘重启生效；console 自身 protected；审计/策略/数据源 | PASS（`console_test`/`disabled_test` + 截图） |
+| R11.8 | Agent 上下文显示 | `agent.context` 每步广播；ContextMeter 圆环 + 分段条 + 三项图例 + 口径；contextWindow=0 降级只显示已用 | PASS（`context_test` + 截图 3.8% ~37.6K/1M） |
+| R11.9 | 多智能体/子智能体可视化 | `agent.spawn` 子会话 + `agent.child` 事件 + `tree`；编队页花名册/谱系树/节点详情；父取消级联、子不可再派生、最多 2 后代 | PASS（`spawn_test` + 截图 1 主 2 子） |
+| R11.10 | 页面视觉刷新 | 设计系统 v2（层次/导航图标/折叠/表格 sticky/浮层/骨架屏）；1280×800 各面板逐页截图；自选操作列 sticky、资金流图 200px 不塌陷 | PASS（截图 + `npm run build`） |
+
+**一键验收**：`scripts/verify.sh --with-wails --with-race` 期望 9 插件 / 29 工具 / 9 面板全 PASS（见附录 A）。
+
 ## 附录 A 当前基线（接线完成后实测）
 
 采集于集成末期。总览与面板清单为本机实跑输出，R3–R9 的结论取自 lead 的集成实测记录。
@@ -474,7 +493,7 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 | 条目 | 结论 | 证据 |
 |---|---|---|
 | R1 删除教学代码 | 通过 | `cmd/mini` 不存在 |
-| R2 插件架构 | 通过 | 8/8 激活，工具 27 |
+| R2 插件架构 | 通过 | 10/10 激活，工具 39 |
 | R3 数据层 | 通过 | 实测 5/5 live |
 | R4 回测 | 通过 | 11 项测试；报告含成本四行（佣金/印花税/过户费/滑点） |
 | R5 Agent harness | 通过 | 盘前任务用真实模型跑 8 步并产出计划 |
@@ -483,6 +502,34 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 | R8 面板 | 通过 | 8 个面板均在桌面端验证；`watch` 面板浏览器验证通过（规则列表/开关/编辑器/指标 chips/一句话创建/触发日志） |
 | R9 安全 | 通过 | 脱敏、白名单、路径、审计均通过；工具索引无 `exec` |
 | R10 自定义 Watchdog | 通过（面板 PASS，2026-11-10 手工执行） | 5 个 `watchdog.*` 工具齐备；规则热加载、试运行、日志、限流有单测；watch 面板：规则列表/开关可逆/试运行(scenarios+prompt)/日志无新增 |
+
+### A.3.1 R11 体验修复验收（2026-11-11）
+
+| 条目 | 结论 | 证据 |
+|---|---|---|
+| R11.1 Agent 流式日志 | 通过 | 连续 delta 合并为一段（时间戳只在段首、流式光标），心跳合并 `×N`；`agent.context` 作为轮次边界 |
+| R11.2 预算耗尽收口 | 通过 | token/步数停机后强制一次无工具收口调用；报告含结论并区分停机原因；`go test ./internal/agent ./test` |
+| R11.3 数据源健康点 | 通过 | 中文/英文状态前缀分类；`cache` 计量值过滤；未知文案归灰不误报红 |
+| R11.4 自选跳 K 线 | 通过 | 行点击、行内「K线」、资金抽屉「打开 K 线」均激活 kline 面板并写入 `state.focus` |
+| R11.5 K 线双尺度 | 通过 | `kline.analyze` 返回 `horizons[]`（短线 60 根 / 长线 250 根）；面板分段切换，旧后端自动回退 |
+| R11.6 Markdown 表格 | 通过 | GFM 表头 + 分隔行渲染为 `<table>`；交易明细不再降级为等宽文本；XSS 转义保留 |
+| R11.7 量化算法与优化 | 通过 | `strategies` 返回 `formula/rules/costs`；新增 `optimize` 方法 + `quant.optimize` 工具（邻域稳健性 + walk-forward） |
+| R11.8 资金流面板 | 通过 | `rank` 支持 `direction=in/out/all`；面板改为板块/概念**多线资金流**（默认 TOP8+8、区间累计、点榜单行增删图线）+ 并排流入/流出双榜；新增 `sectorHistory`/`sectorBatch` 与 `sector.history`，不再展示个股资金卡 |
+| R11.9 模型接入 | 通过 | OpenCode 兼容网关预设；WorkBuddy 登录态（凭证库 0600、token 不落日志/不回传、请求体规范化）；`go test ./internal/llm ./plugins/modelsettings` |
+
+### A.3.2 R12 Agent 中心化与市场数据（2026-11-11）
+
+| 条目 | 结论 | 证据 |
+|---|---|---|
+| R12.1 总控对话 | 通过 | 新增 router worker 并置于第一位；空 worker 默认走总控；总控 system prompt 动态列 worker 目录；可 `agent.spawn` 分派 |
+| R12.2 自定义 worker | 通过 | `worker.create`/`worker.list` 工具 + `agentlab.createWorker/removeWorker`；`agent_workers` 落盘；id/长度/数量校验；模板与模型可编辑 |
+| R12.3 Worker 点击 | 通过 | 点击 worker 切 Worker 详情并自动打开最近会话日志/报告；运行中不打断 |
+| R12.4 Agent 模型选择 | 通过 | `run/send` 与 `agent.*` 支持 `model`；优先级：显式 > 模板 > 默认；调度使用模板模型；`provider/model` 可被 `llm.pick` 精确匹配 |
+| R12.5 Max Tokens | 通过 | 官方模型只读官方最大输出；自定义模型可手填；后端 `DefaultMaxTokensFor` 同步返回 maxOutput |
+| R12.6 自选分时 | 通过 | 东财 trends2 主源、腾讯兜底；走势列分时小图 + 分时大图（价格/均价/昨收/量）；`market.minute` 工具 |
+| R12.7 市场中心 | 通过 | 指数、涨跌家数、涨停/跌停/炸板、**同花顺小时/日热榜**、涨停梯队、龙虎榜；`market.indices/breadth/ladder/longhu/hot` 五个只读工具；单块降级 |
+| R12.8 Agent 中心化 | 通过 | agentlab UI order=1、默认落地页、默认 activeWorker=router；原有值班/编队/插话保留 |
+| R12.9 回归 | 通过 | `scripts/verify.sh --with-race --with-network`；`wails build`；真实联网冒烟（指数/宽度/梯队/龙虎榜、板块资金流、分时） |
 
 ### A.4 交付时不计为失败的已知限制
 
@@ -493,6 +540,9 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 | K 线主源 | 东财 K 线端点不可达 | K 线以同花顺为主源；东财仍提供资金流与板块数据 |
 | 情绪指标 | 涨停家数 / 炸板率 / 连板高度无工具 | 知识库 `theme-sentiment-cycle.md` 有口径，工具列 P1 |
 | Watch 条件能力 | 只支持 22 个白名单指标的数值比较 | 不支持自定义指标与函数；非交易时段不求值。越界表达式必须被解析器拒绝 |
+| WorkBuddy 网关 | 官方协议可能调整（错误码 11101/11128 等） | 保留错误码与可操作提示；协议变化时按 go-stock 的实测记录继续适配，不静默降级 |
+| WorkBuddy 退出登录 | 只清本应用自己的凭证 | 若 dsh / go-stock 仍有登录态，会被再次发现并导入（与 go-stock 语义一致） |
+| 参数优化稳健性 | 基于离散参数网格的邻域夏普 | 只衡量参数敏感性，不衡量经济含义或未来有效性；报告强制附样本外结论 |
 
 命中以上限制时不记 FAIL；但"静默降级"（没有角标、没有错误）仍记 FAIL。
 
@@ -500,9 +550,9 @@ go run . --headless --task=watch-test -- <规则ID>  # 对照面板试运行结�
 
 | 检查项 | 期望 | 归属 |
 |---|---|---|
-| `content/skills/*/SKILL.md` frontmatter 可被 yaml.v3 解析 | 6/6 通过 | product |
-| 技能正文 80–200 行 | 6/6 在区间内 | product |
-| skill description ≤ 60 字 | 6/6 通过 | product |
+| `content/skills/*/SKILL.md` frontmatter 可被 yaml.v3 解析 | 10/10 通过 | product |
+| 技能正文 80–200 行 | 原有 6 个在区间内；导入的 4 个为参考长文，不设行数上限 | product |
+| skill description ≤ 60 字 | 10/10 通过 | product |
 | `content/kb/*.md` 每篇有且仅有一个 H1 | 10/10 | product |
 | kb 每篇正文 300–800 汉字 | 10/10 | product |
 | 成本口径（DOMAIN 4.3）与回测实现一致 | 四项参数逐字一致 | backend-data |

@@ -7,6 +7,7 @@ import type {
   EquityPoint,
   KlineAnalyzeResponse,
   ParamDef,
+  QuantFill,
   QuantResult,
   QuantTrade,
   StrategySpec,
@@ -207,15 +208,37 @@ export function toModelInfo(v: unknown): ModelInfo {
     maxTokens: pickNum(r, 'maxTokens'),
     name: pickStr(r, 'name'),
     id: pickStr(r, 'id'),
+    authMode: toAuthMode(pickStr(r, 'authMode')),
+    accountName: pickStr(r, 'accountName'),
+    expiresAt: pickStr(r, 'expiresAt'),
   }
+}
+
+/** 接入方式归一：未知/缺失回落成 apiKey（兼容旧后端）。 */
+function toAuthMode(raw: string | undefined): 'apiKey' | 'workbuddy' | 'opencode' {
+  return raw === 'workbuddy' || raw === 'opencode' ? raw : 'apiKey'
+}
+
+/** worker 类别归一：后端判据是 kind，旧的裸数组没有 kind 时按 id/custom 布尔回落。 */
+function toWorkerKind(r: Record<string, unknown>, id: string): 'main' | 'preset' | 'custom' {
+  const raw = pickStr(r, 'kind')
+  if (raw === 'main' || raw === 'preset' || raw === 'custom') return raw
+  if (pickBool(r, 'main') === true || id === 'router') return 'main'
+  if (pickBool(r, 'custom') === true) return 'custom'
+  return 'preset'
 }
 
 export function toWorker(v: unknown): WorkerInfo {
   const r = rec(v) ?? {}
+  const id = pickStr(r, 'id') ?? ''
+  const kind = toWorkerKind(r, id)
   return {
-    id: pickStr(r, 'id') ?? '',
+    id,
     title: pickStr(r, 'title', 'name') ?? '',
     description: pickStr(r, 'description', 'summary') ?? '',
+    kind,
+    custom: kind === 'custom',
+    model: pickStr(r, 'model') || undefined,
   }
 }
 
@@ -350,6 +373,8 @@ export function toStrategySpec(v: unknown): StrategySpec {
     desc: pickStr(r, 'desc', 'description') ?? '',
     params: params.length > 0 ? params : undefined,
     default: def,
+    rules: strList(pickArr(r, 'rules')),
+    formula: pickStr(r, 'formula'),
   }
 }
 
@@ -411,6 +436,25 @@ export function toQuantResult(v: unknown): QuantResult {
     costs: toCosts(r.costs),
     warnings: strList(pickArr(r, 'warnings')),
   }
+}
+
+/** 逐笔成交（quant run 顶层 trades / result.fills）：只保留有日期与价格的合法条目。 */
+export function toQuantFills(v: unknown): QuantFill[] {
+  return arr(v)
+    .map((item) => {
+      const r = rec(item) ?? {}
+      const side = pickStr(r, 'side') === 'sell' ? 'sell' : 'buy'
+      const fill: QuantFill = {
+        date: pickStr(r, 'date') ?? '',
+        side,
+        price: num(r.price),
+        qty: num(r.qty),
+      }
+      const reason = pickStr(r, 'reason')
+      if (reason) fill.reason = reason
+      return fill
+    })
+    .filter((f) => f.date !== '' && f.price > 0)
 }
 
 export function toFold(v: unknown): WalkForwardFold {
@@ -478,6 +522,38 @@ export function toKlineAnalyze(v: unknown): KlineAnalyzeResponse {
     warning: pickStr(r, 'warning', 'stale'),
     support: toNumList(pickArr(r, 'support')),
     resistance: toNumList(pickArr(r, 'resistance')),
+    horizons: pickArr(r, 'horizons')
+      .map((x) => rec(x))
+      .filter((x): x is Record<string, unknown> => x !== null)
+      .map((x) => {
+        const hs = rec(x.summary) ?? {}
+        return {
+          key: pickStr(x, 'key') === 'long' ? ('long' as const) : ('short' as const),
+          title: pickStr(x, 'title') ?? '',
+          window: pickNum(x, 'window') ?? 0,
+          bias: pickStr(x, 'bias') ?? '—',
+          summary: {
+            trend: pickStr(hs, 'trend') ?? '—',
+            ma: pickStr(hs, 'ma') ?? '—',
+            rsi: pickStr(hs, 'rsi') ?? '—',
+            macd: pickStr(hs, 'macd') ?? '—',
+            atr: pickStr(hs, 'atr') ?? '—',
+          },
+          patterns: pickArr(x, 'patterns')
+            .map((y) => rec(y))
+            .filter((y): y is Record<string, unknown> => y !== null)
+            .map((y) => ({
+              name: pickStr(y, 'name') ?? '',
+              index: pickNum(y, 'index') ?? 0,
+              confidence: pickNum(y, 'confidence') ?? 0,
+              note: pickStr(y, 'note'),
+            }))
+            .filter((y) => y.name !== ''),
+          support: toNumList(pickArr(x, 'support')),
+          resistance: toNumList(pickArr(x, 'resistance')),
+        }
+      })
+      .filter((h) => h.title !== ''),
   }
 }
 

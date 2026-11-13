@@ -5,9 +5,12 @@ package builtin
 import (
 	_ "github.com/yazzyk/stock-agent/plugins/agentlab"
 	_ "github.com/yazzyk/stock-agent/plugins/all"
+	_ "github.com/yazzyk/stock-agent/plugins/console"
 	_ "github.com/yazzyk/stock-agent/plugins/fundflow"
+	_ "github.com/yazzyk/stock-agent/plugins/fuyao"
 	_ "github.com/yazzyk/stock-agent/plugins/kline"
 	_ "github.com/yazzyk/stock-agent/plugins/knowledge"
+	_ "github.com/yazzyk/stock-agent/plugins/marketcenter"
 	_ "github.com/yazzyk/stock-agent/plugins/modelsettings"
 	_ "github.com/yazzyk/stock-agent/plugins/quant"
 	_ "github.com/yazzyk/stock-agent/plugins/watch"

@@ -1,0 +1,11 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-income",
+  "data": {
+    "timestamp": 1767110400000,
+    "item": [
+      {"thscode":"600519.SH","ticker":"600519","period":"annual","fiscal_year":2025,"report_date":"2025-12-31","total_operating_income":180000000000,"operating_profit":100000000000,"net_profit":60000000000}
+    ]
+  }
+}

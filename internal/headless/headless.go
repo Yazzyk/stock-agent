@@ -56,6 +56,12 @@ func Run(ctx context.Context, k *kernel.Kernel, task string, args []string, w io
 			period = args[1]
 		}
 		return callTool(ctx, k, "kline.analyze", map[string]any{"code": args[0], "period": period}, w)
+	case "minute":
+		if len(args) == 0 {
+			fmt.Fprintln(w, "用法: --task=minute -- 600000")
+			return 2
+		}
+		return minuteSummary(ctx, k, args[0], w)
 	case "strategies":
 		return invoke(ctx, k, "quant", "strategies", map[string]any{}, w)
 	case "backtest":
@@ -114,10 +120,14 @@ func Run(ctx context.Context, k *kernel.Kernel, task string, args []string, w io
 
 func selftest(ctx context.Context, k *kernel.Kernel, w io.Writer) int {
 	st := k.Status()
-	fmt.Fprintf(w, "插件: %d 个，已激活 %d 个；工具 %d 个；面板 %d 个\n", st.Plugins, st.Active, st.Tools, st.UI)
+	fmt.Fprintf(w, "插件: %d 个，已激活 %d 个，已停用 %d 个；工具 %d 个；面板 %d 个\n", st.Plugins, st.Active, len(k.Disabled()), st.Tools, st.UI)
 	for _, p := range k.Plugins() {
 		state := "ok"
-		if !p.Active {
+		switch {
+		case p.Disabled:
+			// 用户主动停用不算故障：启动时 markSkipped，这里如实展示。
+			state = "已停用"
+		case !p.Active:
 			state = "未激活"
 			if p.Error != "" {
 				state += "(" + p.Error + ")"
@@ -136,9 +146,9 @@ func selftest(ctx context.Context, k *kernel.Kernel, w io.Writer) int {
 			fmt.Fprintf(w, "模型: %s/%s key=%v default=%v\n", m.Provider, m.Model, m.HasKey, m.IsDefault)
 		}
 	}
-	fail := st.Plugins == 0 || st.Active != st.Plugins
-	if fail {
-		fmt.Fprintln(w, "结果: FAIL（插件未全部激活）")
+	// 停用是用户的显式选择：只有「既没激活也没停用」才算故障。
+	if fail := st.Plugins == 0 || st.Active+len(k.Disabled()) != st.Plugins; fail {
+		fmt.Fprintln(w, "结果: FAIL（插件未全部激活，且不全是主动停用）")
 		return 1
 	}
 	fmt.Fprintln(w, "结果: OK")
@@ -171,6 +181,43 @@ func callTool(ctx context.Context, k *kernel.Kernel, name string, payload map[st
 	return 0
 }
 
+// minuteSummary 输出分时摘要（来源/名称/日期/点数与前 3 个点），
+// 避免 241 个点把终端输出撑爆，同时能直接看出降级到了哪个数据源。
+func minuteSummary(ctx context.Context, k *kernel.Kernel, code string, w io.Writer) int {
+	raw, _ := json.Marshal(map[string]any{"code": code})
+	out, err := k.Invoke(ctx, "kline", "minute", raw)
+	if err != nil {
+		fmt.Fprintf(w, "调用 kline.minute 失败: %v\n", err)
+		return 1
+	}
+	var series struct {
+		Code      string  `json:"code"`
+		Name      string  `json:"name"`
+		Date      string  `json:"date"`
+		Source    string  `json:"source"`
+		PrevClose float64 `json:"prevClose"`
+		Points    []struct {
+			Time   string  `json:"time"`
+			Price  float64 `json:"price"`
+			Avg    float64 `json:"avg"`
+			Volume float64 `json:"volume"`
+		} `json:"points"`
+	}
+	if err := json.Unmarshal(out, &series); err != nil {
+		fmt.Fprintf(w, "解析分时结果失败: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(w, "%s %s 日期=%s 来源=%s 点数=%d 昨收=%.2f\n", series.Code, series.Name, series.Date, series.Source, len(series.Points), series.PrevClose)
+	for i, point := range series.Points {
+		if i >= 3 {
+			fmt.Fprintln(w, "…")
+			break
+		}
+		fmt.Fprintf(w, "  %s 价=%.2f 均价=%.2f 量=%.0f\n", point.Time, point.Price, point.Avg, point.Volume)
+	}
+	return 0
+}
+
 func invoke(ctx context.Context, k *kernel.Kernel, pluginID, method string, payload map[string]any, w io.Writer) int {
 	raw, _ := json.Marshal(payload)
 	out, err := k.Invoke(ctx, pluginID, method, raw)
@@ -192,7 +239,12 @@ func pretty(raw json.RawMessage) string {
 		return string(raw)
 	}
 	if len(b) > 4000 {
-		return string(b[:4000]) + "\n…（已截断）"
+		// 按 rune 截断：按字节切会把中文 UTF-8 序列切断，产出非法 JSON。
+		r := []rune(string(b))
+		if len(r) > 4000 {
+			return string(r[:4000]) + "\n…（已截断）"
+		}
+		return string(b)
 	}
 	return string(b)
 }

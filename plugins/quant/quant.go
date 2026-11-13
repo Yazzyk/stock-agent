@@ -53,9 +53,10 @@ func (p *Plugin) Activate(c *plugin.Context) error {
 		return err
 	}
 	for _, m := range []plugin.Method{
-		{Name: "strategies", Description: "列出内置策略与参数", Fn: p.strategies},
+		{Name: "strategies", Description: "列出内置策略、参数与全局口径", Fn: p.strategies},
 		{Name: "run", Description: "单次回测", Fn: p.run},
 		{Name: "walkforward", Description: "walk-forward 过拟合检验", Fn: p.walkforward},
+		{Name: "optimize", Description: "参数优化：邻域稳健性 + walk-forward 样本外", Fn: p.optimize},
 	} {
 		if err := c.Methods.Add(m); err != nil {
 			return err
@@ -83,8 +84,29 @@ func (p *Plugin) Activate(c *plugin.Context) error {
 	}); err != nil {
 		return err
 	}
+	if err := c.Tools.Add(plugin.Tool{
+		Name:    "quant.optimize",
+		Title:   "优化策略参数",
+		Summary: "在默认参数网格上做样本内筛选 + 邻域稳健性 + walk-forward 样本外验证，用于优化策略参数而不是选股",
+		Tags:    []string{"quant", "research"},
+		Risk:    plugin.RiskNetwork,
+		Schema: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "code":    {"type": "string", "description": "股票代码，如 600000"},
+    "strategy":{"type": "string", "enum": ["ma", "rsi", "momentum", "buyhold"], "description": "策略 ID"},
+    "folds":   {"type": "integer", "description": "walk-forward 折数，默认 3，范围 2~6"},
+    "limit":   {"type": "integer", "description": "回看 K 线数量，默认 500，上限 1200"}
+  },
+  "required": ["code"]
+}`),
+		Examples: []string{`{"code":"600000","strategy":"ma","folds":3}`},
+		Run:      p.toolOptimize,
+	}); err != nil {
+		return err
+	}
 	return c.UI.Add(plugin.UISlot{
-		ID: "quant", Title: "量化研究", Icon: "chart", Group: "研究",
+		ID: "quant", Title: "量化研究", Icon: "sigma", Group: "研究",
 		Component: "quant", Order: 45,
 	})
 }
@@ -124,6 +146,31 @@ func (e *Engine) WalkForward(ctx context.Context, code, strategy string, folds, 
 		backtest.Options{InitialCash: 100000, Cost: backtest.DefaultCost(), Warmup: 2}), nil
 }
 
+// Optimize 取日线并在默认网格上做参数优化；folds<=0 时按 3 折处理。
+func (e *Engine) Optimize(ctx context.Context, code, strategy string, folds, limit int) (backtest.OptimizeResult, error) {
+	bars, warning, err := e.bars(ctx, code, "day", limit)
+	if err != nil {
+		return backtest.OptimizeResult{}, err
+	}
+	if strategy == "" {
+		strategy = "ma"
+	}
+	if folds <= 0 {
+		folds = 3
+	}
+	res := backtest.Optimize(code, bars, strategy, backtest.DefaultGrid(strategy), folds,
+		backtest.Options{InitialCash: 100000, Cost: backtest.DefaultCost(), Warmup: 2})
+	if warning != "" {
+		if res.Note != "" {
+			res.Note += "；" + warning
+		} else {
+			res.Note = warning
+		}
+		res.Report = "> " + warning + "\n\n" + res.Report
+	}
+	return res, nil
+}
+
 // bars 优先前复权；数据源不支持复权时降级为不复权并明确告知。
 func (e *Engine) bars(ctx context.Context, code, period string, limit int) ([]contract.Bar, string, error) {
 	if strings.TrimSpace(code) == "" {
@@ -152,26 +199,33 @@ func (e *Engine) bars(ctx context.Context, code, period string, limit int) ([]co
 // ---------- 方法 ----------
 
 type runInput struct {
-	Code        string             `json:"code"`
-	Period      string             `json:"period"`
-	Strategy    string             `json:"strategy"`
-	Params      backtest.ParamSet  `json:"params"`
-	Limit       int                `json:"limit"`
-	InitialCash float64            `json:"initialCash"`
-	Adjust      string             `json:"adjust"`
+	Code        string            `json:"code"`
+	Period      string            `json:"period"`
+	Strategy    string            `json:"strategy"`
+	Params      backtest.ParamSet `json:"params"`
+	Limit       int               `json:"limit"`
+	InitialCash float64           `json:"initialCash"`
+	Adjust      string            `json:"adjust"`
 }
 
 type runOutput struct {
-	Code    string            `json:"code"`
-	Period  string            `json:"period"`
-	Adjust  string            `json:"adjust"`
-	Warning string            `json:"warning,omitempty"`
-	Result  backtest.Result   `json:"result"`
-	Report  string            `json:"report"`
+	Code    string          `json:"code"`
+	Period  string          `json:"period"`
+	Adjust  string          `json:"adjust"`
+	Warning string          `json:"warning,omitempty"`
+	Result  backtest.Result `json:"result"`
+	// Trades 是逐笔成交（与 result.fills 同一份数据，≤500 条），供前端在 K 线上画买卖标记。
+	// result.trades 仍是「建仓→清仓」的往返交易，语义没有变，旧的读取方不受影响。
+	Trades []backtest.Fill `json:"trades"`
+	Report string          `json:"report"`
 }
 
 func (p *Plugin) strategies(context.Context, json.RawMessage) (any, error) {
-	return map[string]any{"strategies": backtest.Specs()}, nil
+	return map[string]any{
+		"strategies": backtest.Specs(),
+		"rules":      backtest.Rules(),
+		"costs":      backtest.DefaultCost(),
+	}, nil
 }
 
 func (p *Plugin) run(ctx context.Context, payload json.RawMessage) (any, error) {
@@ -188,7 +242,15 @@ func (p *Plugin) run(ctx context.Context, payload json.RawMessage) (any, error) 
 	if warning != "" {
 		adjust = "none"
 	}
-	return runOutput{Code: in.Code, Period: in.Period, Adjust: adjust, Warning: warning, Result: res, Report: res.Report()}, nil
+	trades := res.Fills
+	if trades == nil {
+		// 保证前端拿到的是数组而不是 null（空数组可以直接 .length）。
+		trades = []backtest.Fill{}
+	}
+	return runOutput{
+		Code: in.Code, Period: in.Period, Adjust: adjust, Warning: warning,
+		Result: res, Trades: trades, Report: res.Report(),
+	}, nil
 }
 
 type wfInput struct {
@@ -211,6 +273,36 @@ func (p *Plugin) walkforward(ctx context.Context, payload json.RawMessage) (any,
 		return nil, err
 	}
 	return map[string]any{"result": res, "report": res.Report()}, nil
+}
+
+// optimize 是全样本参数优化：默认网格 + 邻域稳健性 + walk-forward 样本外。
+func (p *Plugin) optimize(ctx context.Context, payload json.RawMessage) (any, error) {
+	var in wfInput
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return nil, fmt.Errorf("参数格式错误：%w", err)
+	}
+	res, err := (&Engine{data: p.data}).Optimize(ctx, in.Code, in.Strategy, in.Folds, in.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"result": res}, nil
+}
+
+// toolOptimize 给 LLM 用：回优化摘要 + 报告，不回完整净值（参数优化本身不产生净值序列）。
+func (p *Plugin) toolOptimize(ctx context.Context, args json.RawMessage) (any, error) {
+	var in wfInput
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil, fmt.Errorf("参数格式错误：%w", err)
+	}
+	res, err := (&Engine{data: p.data}).Optimize(ctx, in.Code, in.Strategy, in.Folds, in.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"code": res.Code, "strategy": res.Strategy, "start": res.Start, "end": res.End,
+		"best": res.Best, "candidates": res.Candidates,
+		"walkforward": res.WalkForward, "note": res.Note, "report": res.Report,
+	}, nil
 }
 
 // toolBacktest 给 LLM 用：只回摘要 + 报告，不回完整净值序列（省上下文）。

@@ -1,0 +1,13 @@
+{
+  "code": 0,
+  "message": "success",
+  "request_id": "fixture-snapshot",
+  "data": {
+    "timestamp": 1794552945000,
+    "total": 2,
+    "item": [
+      {"thscode":"600519.SH","ticker":"600519","volume":3950084,"turnover":5627798300.5,"last_price":1421.0,"price_change":21.8,"price_change_ratio_pct":1.56,"open_price":1405.0,"high_price":1430.0,"low_price":1400.1,"prev_price":1399.2},
+      {"thscode":"000001.SZ","ticker":"000001","volume":88123400,"turnover":998765400.0,"last_price":11.35,"price_change":-0.12,"price_change_ratio_pct":-1.05,"open_price":11.5,"high_price":11.52,"low_price":11.31,"prev_price":11.47}
+    ]
+  }
+}

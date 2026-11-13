@@ -14,7 +14,7 @@ import (
 
 func allowlistPolicy(root string) contract.Policy {
 	return contract.Policy{
-		NetworkAllowlist: []string{"eastmoney.com", "10jqka.com.cn", "gtimg.cn", "sinajs.cn"},
+		NetworkAllowlist: []string{"10jqka.com.cn", "gtimg.cn", "sinajs.cn", "sina.com.cn"},
 		PathRoots:        []string{root},
 		AllowExec:        false,
 		MaxReqPerMin:     2,
@@ -104,22 +104,25 @@ func TestGuardAllowHost(t *testing.T) {
 		host string
 		want bool
 	}{
-		{"push2.eastmoney.com", true},
-		{"eastmoney.com", true},
-		{"EASTMONEY.COM", true},
-		{"push2.eastmoney.com:443", true},
-		{"https://push2.eastmoney.com/api/qt/stock/get?secid=1.600000", true},
-		{"data.eastmoney.com", true},
+		{"hq.sinajs.cn", true},
+		{"sina.com.cn", true},
+		{"SINAJS.CN", true},
+		{"vip.stock.finance.sina.com.cn:443", true},
+		{"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssi_ssfx_flzjtj?daima=sh600000", true},
+		{"feed.mix.sina.com.cn", true},
 		{"d.10jqka.com.cn", true},
 		{"qt.gtimg.cn", true},
-		{"eastmoney.com.evil.com", false},
+		{"sinajs.cn.evil.com", false},
 		{"evil.com", false},
-		{"noteastmoney.com", false},
-		{"evil.com:443.eastmoney.com", false},
+		{"notsinajs.cn", false},
+		// 东财域名已从白名单移除：它现在应当被拒绝，而不是被放行。
+		{"push2.eastmoney.com", false},
+		{"data.eastmoney.com", false},
+		{"evil.com:443.sinajs.cn", false},
 		// 端口后带垃圾 / 非数字端口：authority 非法，必须拒绝（backend-core 已收紧 normalizeHost）
-		{"eastmoney.com:443.evil.com", false},
-		{"push2.eastmoney.com:abc", false},
-		{"EASTMONEY.COM:443", true},
+		{"sinajs.cn:443.evil.com", false},
+		{"hq.sinajs.cn:abc", false},
+		{"SINAJS.CN:443", true},
 		{"https://d.10jqka.com.cn/v6/line/hs_600000/01/last.js", true},
 		{"", false},
 		{"127.0.0.1", false},

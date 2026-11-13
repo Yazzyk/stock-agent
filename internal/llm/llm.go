@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/deepseek"
 	einopenai "github.com/cloudwego/eino-ext/components/model/openai"
@@ -27,6 +28,21 @@ const (
 	settingsKey    = "llm"
 	httpTimeoutSec = 120
 )
+
+// reasoningFallbackNote 是"只有推理内容、正文为空"时的统一标注前缀。
+// 推理模型（DeepSeek V4 等）在 max_tokens 不足时会把预算全花在思维链上，正文为空；
+// 这时直接把推理内容当正文返回并**明确标注**，绝不能让上层误判成"模型没返回内容"。
+// 注意：internal/agent 里有一份同文案常量 reasoningFallbackNote，两边必须保持一致。
+const reasoningFallbackNote = "（以下为模型推理过程，正文为空）"
+
+// reasoningFallbackText 把推理内容包装成"可当正文展示"的文本。
+func reasoningFallbackText(reasoning string) string {
+	body := strings.TrimSpace(reasoning)
+	if body == "" {
+		return ""
+	}
+	return reasoningFallbackNote + "\n\n" + body
+}
 
 // Config 是 bootstrap 注入的依赖。
 type Config struct {
@@ -54,17 +70,23 @@ type settingsFile struct {
 }
 
 // ProviderView 是给前端的展平视图：contract.ModelInfo + id。
+// AuthMode/AccountName/ExpiresAt 只在 WorkBuddy/OpenCode 这类特殊接入方式下出现；
+// 账号名与到期时间仅用于展示，绝不包含任何 token。
 type ProviderView struct {
 	ID string `json:"id"`
 	contract.ModelInfo
+	AuthMode    string `json:"authMode,omitempty"`
+	AccountName string `json:"accountName,omitempty"`
+	ExpiresAt   string `json:"expiresAt,omitempty"`
 }
 
 // Service 同时实现 contract.LLMService 与模型管理能力。
 type Service struct {
-	cfg     Config
-	log     *slog.Logger
-	ring    *keyring
-	mu      sync.RWMutex
+	cfg      Config
+	log      *slog.Logger
+	ring     *keyring
+	wb       *workBuddy
+	mu       sync.RWMutex
 	settings settingsFile
 }
 
@@ -93,6 +115,7 @@ func New(cfg Config) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{cfg: cfg, log: cfg.Logger, ring: ring}
+	s.wb = newWorkBuddy(filepath.Join(cfg.DataDir, workBuddyVaultDirName), cfg.Logger)
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -160,7 +183,14 @@ func (s *Service) Chat(ctx context.Context, req contract.ChatRequest) (contract.
 	if err != nil {
 		return contract.Reply{}, s.wrapErr(p, err)
 	}
-	return contract.Reply{Message: fromEinoMessage(out, names), Usage: usageOf(out), Model: p.Model}, nil
+	msg := fromEinoMessage(out, names)
+	// 非流式路径同样要兜住"正文为空但推理内容非空"：不标注就等于把真实原因吞掉。
+	if strings.TrimSpace(msg.Content) == "" {
+		if reason := reasoningFallbackText(out.ReasoningContent); reason != "" {
+			msg.Content = reason
+		}
+	}
+	return contract.Reply{Message: msg, Usage: usageOf(out), Model: p.Model}, nil
 }
 
 func (s *Service) Stream(ctx context.Context, req contract.ChatRequest, onDelta func(string)) (contract.Reply, error) {
@@ -205,26 +235,67 @@ func (s *Service) Stream(ctx context.Context, req contract.ChatRequest, onDelta 
 			acc.PromptTokens = maxInt(acc.PromptTokens, u.PromptTokens)
 			acc.CompletionTokens = maxInt(acc.CompletionTokens, u.CompletionTokens)
 			acc.TotalTokens = maxInt(acc.TotalTokens, u.TotalTokens)
+			// 缓存命中数同样逐 chunk 累计：有些上游只把它放在中间 chunk 上。
+			acc.CachedTokens = maxInt(acc.CachedTokens, u.PromptTokenDetails.CachedTokens)
 		}
 		if msg.Content != "" && onDelta != nil {
 			onDelta(msg.Content)
 		}
 	}
 	if len(chunks) == 0 {
-		return contract.Reply{}, fmt.Errorf("llm: 模型 %s 未返回任何内容", p.Model)
+		return contract.Reply{}, fmt.Errorf("llm: 模型 %s 没有返回任何 chunk：连接被对端关闭或请求被服务端丢弃（检查模型名、Base URL 与网络）", p.Model)
 	}
 	merged, err := schema.ConcatMessages(chunks)
 	if err != nil {
 		return contract.Reply{}, fmt.Errorf("llm: 合并流式结果失败: %w", err)
 	}
-	usage := usageOf(merged)
-	if usage.TotalTokens == 0 {
-		usage = acc
-	}
+	usage := streamUsage(merged, acc)
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
-	return contract.Reply{Message: fromEinoMessage(merged, names), Usage: usage, Model: p.Model}, nil
+	// 有 chunk 但全空要单独给文案：它意味着"流正常结束但模型没吐出任何可用内容"，
+	// 与 len(chunks)==0（连接层直接断流）是两种完全不同的故障，排障方向也不同。
+	if isEmptyAssistant(merged) {
+		finish := ""
+		if merged.ResponseMeta != nil {
+			finish = strings.TrimSpace(merged.ResponseMeta.FinishReason)
+		}
+		switch {
+		case finish == "content_filter":
+			return contract.Reply{}, fmt.Errorf("llm: 模型 %s 的回复被上游内容过滤拦截，未返回任何正文（finish_reason=content_filter），请换一种问法", p.Model)
+		case finish == "length":
+			return contract.Reply{}, fmt.Errorf("llm: 模型 %s 的输出 token 预算被占满，正文为空（finish_reason=length）：该模型可能是推理模型，推理过程吃掉了全部 max_tokens，请在“模型设置”里调大 MaxTokens", p.Model)
+		default:
+			return contract.Reply{}, fmt.Errorf("llm: 模型 %s 收到了 %d 个 chunk，但正文与推理内容都是空的（finish_reason=%q）：上游返回了空 chunk，请重试或查看上游服务状态", p.Model, len(chunks), finish)
+		}
+	}
+	msg := fromEinoMessage(merged, names)
+	// 只有推理内容、正文为空：把推理内容当正文返回并明确标注（不静默丢弃）。
+	// 流式期间的 onDelta 只推正文，所以前面不会推过任何内容；这里补一次完整文本，
+	// 让前端的流式气泡与最终报告保持一致，不会出现"输入框转完却一片空白"。
+	if strings.TrimSpace(msg.Content) == "" {
+		if reason := reasoningFallbackText(merged.ReasoningContent); reason != "" {
+			msg.Content = reason
+			if onDelta != nil {
+				onDelta(reason)
+			}
+		}
+	}
+	if merged.ResponseMeta != nil {
+		msg.FinishReason = strings.TrimSpace(merged.ResponseMeta.FinishReason)
+	}
+	return contract.Reply{Message: msg, Usage: usage, Model: p.Model}, nil
+}
+
+// isEmptyAssistant 判断合并后的助手消息是否"没有任何可用内容"（正文、推理、工具调用都为空）。
+func isEmptyAssistant(m *schema.Message) bool {
+	if m == nil {
+		return true
+	}
+	if strings.TrimSpace(m.Content) != "" || strings.TrimSpace(m.ReasoningContent) != "" {
+		return false
+	}
+	return len(m.ToolCalls) == 0
 }
 
 func (s *Service) Models(context.Context) ([]contract.ModelInfo, error) {
@@ -266,6 +337,16 @@ func (s *Service) pick(modelOrID string) (Provider, error) {
 		}
 		return s.settings.Providers[0], nil
 	}
+	// 支持 provider/model 形式：同名模型可能出现在多个 provider 下，
+	// Agent 的模型下拉用这一形式消歧（见 agentlab.models）。
+	if i := strings.Index(key, "/"); i > 0 {
+		provider, model := strings.TrimSpace(key[:i]), strings.TrimSpace(key[i+1:])
+		for _, p := range s.settings.Providers {
+			if p.Provider == provider && p.Model == model {
+				return p, nil
+			}
+		}
+	}
 	for _, p := range s.settings.Providers {
 		if p.ID == key || p.Model == key {
 			return p, nil
@@ -293,6 +374,9 @@ func (s *Service) apiKey(p Provider) (string, error) {
 	if env := envKey(p.Provider); env != "" {
 		return env, nil
 	}
+	if !needsAPIKey(p.Provider) {
+		return "", nil
+	}
 	return "", fmt.Errorf("llm: 未配置 %s 的 API Key，请在「模型设置」里填写", displayProvider(p.Provider))
 }
 
@@ -310,13 +394,16 @@ func (s *Service) build(ctx context.Context, p Provider) (chatModel, error) {
 
 	switch p.Provider {
 	case "deepseek":
+		// DeepSeek 适配器只要求模型名非空，不维护白名单（实测 v0.1.7 仅校验 len(Model)>0），
+		// 因此 deepseek-flash / deepseek-v4-pro 可以原样透传，无需降级到 OpenAI 兼容适配器。
 		return deepseek.NewChatModel(ctx, &deepseek.ChatModelConfig{
-			APIKey:  key,
-			BaseURL: baseURL,
-			Model:   p.Model,
-			Timeout: timeout,
+			APIKey:    key,
+			BaseURL:   baseURL,
+			Model:     p.Model,
+			MaxTokens: maxTokens,
+			Timeout:   timeout,
 		})
-	case "openai", "qwen", "ark", "ollama":
+	case "openai", "qwen", "ark", "ollama", "openai-compat", "opencode":
 		cfg := &einopenai.ChatModelConfig{
 			APIKey:  key,
 			BaseURL: baseURL,
@@ -327,8 +414,15 @@ func (s *Service) build(ctx context.Context, p Provider) (chatModel, error) {
 			cfg.MaxTokens = &maxTokens
 		}
 		return einopenai.NewChatModel(ctx, cfg)
+	case "workbuddy":
+		// WorkBuddy 不是标准 OpenAI 兼容端点：必须 stream=true、禁止 developer 角色、
+		// tool_choice 只能是字符串。这里用自定义 chatModel 适配，鉴权走本机登录态。
+		if strings.TrimSpace(p.Model) == "" {
+			return nil, errors.New("WorkBuddy 还没有选择模型：请先登录 WorkBuddy，再从模型目录里选一个")
+		}
+		return s.wb.chatModel(p.Model, baseURL, maxTokens, 300*time.Second), nil
 	default:
-		return nil, fmt.Errorf("llm: 不支持的 provider %q（可选 deepseek/openai/qwen/ark/ollama）", p.Provider)
+		return nil, fmt.Errorf("llm: 不支持的 provider %q（可选 deepseek/openai/qwen/ark/ollama/openai-compat/opencode/workbuddy）", p.Provider)
 	}
 }
 
@@ -483,6 +577,11 @@ func fromEinoMessage(m *schema.Message, names *toolNameMap) contract.Message {
 		out.Name = m.ToolName
 	default:
 		out.Role = contract.RoleAssistant
+		// 推理内容与结束原因是正文为空时唯一的排障线索，必须原样带回上层。
+		out.ReasoningContent = m.ReasoningContent
+		if m.ResponseMeta != nil {
+			out.FinishReason = strings.TrimSpace(m.ResponseMeta.FinishReason)
+		}
 	}
 	return out
 }
@@ -494,12 +593,34 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// usageOf 把 eino 的 TokenUsage 归一成契约用量；缓存命中数一并带出（上游没给就是 0）。
 func usageOf(m *schema.Message) contract.Usage {
 	if m == nil || m.ResponseMeta == nil || m.ResponseMeta.Usage == nil {
 		return contract.Usage{}
 	}
 	u := m.ResponseMeta.Usage
-	return contract.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, TotalTokens: u.TotalTokens}
+	return contract.Usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		CachedTokens:     u.PromptTokenDetails.CachedTokens,
+	}
+}
+
+// streamUsage 把"合并后的完整消息"与"逐 chunk 累计值"对账：
+// 合并后的消息优先，但 eino 的 ConcatMessages 只做逐字段取最大，
+// 若某个上游/适配器把 prompt_token_details 只放在中间 chunk 上（合并后细节丢失、
+// 只剩 0），这里用逐 chunk 累计到的缓存命中数兜底，避免流式路径静默丢掉缓存命中，
+// 也避免与其它字段口径不一致。
+func streamUsage(merged *schema.Message, acc contract.Usage) contract.Usage {
+	out := usageOf(merged)
+	if out.TotalTokens == 0 {
+		return acc
+	}
+	if out.CachedTokens == 0 && acc.CachedTokens > 0 {
+		out.CachedTokens = acc.CachedTokens
+	}
+	return out
 }
 
 // ---------- 默认值 ----------
@@ -510,18 +631,22 @@ func defaultProvider(provider string) Provider {
 	return p
 }
 
+// defaultModelName 返回该 provider 的默认模型名（与 presets.go 的官方预设保持一致）。
+// 只影响**新建**配置：已有配置里存了什么就继续用什么。
 func defaultModelName(provider string) string {
 	switch provider {
 	case "deepseek":
-		return "deepseek-chat"
+		return "deepseek-flash"
 	case "openai":
-		return "gpt-4o-mini"
+		return "gpt-5-mini"
 	case "qwen":
 		return "qwen-plus"
 	case "ark":
-		return "doubao-1-5-pro-32k"
+		return "doubao-seed-2-1-pro"
 	case "ollama":
 		return "llama3.1"
+	case "opencode":
+		return "qwen3.8-max"
 	default:
 		return provider
 	}
@@ -539,7 +664,13 @@ func defaultBaseURL(provider string) string {
 		return "https://ark.cn-beijing.volces.com/api/v3"
 	case "ollama":
 		return "http://127.0.0.1:11434/v1"
+	case "opencode":
+		return "https://opencode.ai/inference/openai/v1"
+	case "workbuddy":
+		// 真正发请求时按本机凭证的 domain 选国内/国际网关，这里只是展示与兜底。
+		return "https://www.workbuddy.cn/v2"
 	default:
+		// openai-compat 等自定义端点没有内置 Base URL，必须手填。
 		return ""
 	}
 }
@@ -556,8 +687,38 @@ func displayProvider(provider string) string {
 		return "火山方舟"
 	case "ollama":
 		return "Ollama"
+	case "openai-compat":
+		return "OpenAI 兼容"
+	case "opencode":
+		return "OpenCode 兼容网关"
+	case "workbuddy":
+		return "WorkBuddy（本机登录）"
 	default:
 		return provider
+	}
+}
+
+// authModeOf 把 provider 映射成前端的接入方式；空串表示按 API Key 处理（前端会兜底）。
+func authModeOf(provider string) string {
+	switch provider {
+	case "workbuddy":
+		return "workbuddy"
+	case "opencode":
+		return "opencode"
+	default:
+		return ""
+	}
+}
+
+// needsAPIKey 区分「必须填 Key」与「本机/自定义端点可不填」。
+// ollama / openai-compat 经常是本地服务，workbuddy 用本机登录态，空 Key 也能跑通；
+// 其余 provider 缺 Key 直接给可操作错误。
+func needsAPIKey(provider string) bool {
+	switch provider {
+	case "ollama", "openai-compat", "workbuddy":
+		return false
+	default:
+		return true
 	}
 }
 
@@ -571,6 +732,8 @@ func envKey(provider string) string {
 		return strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))
 	case "ark":
 		return strings.TrimSpace(os.Getenv("ARK_API_KEY"))
+	case "opencode":
+		return strings.TrimSpace(os.Getenv("OPENCODE_API_KEY"))
 	default:
 		return ""
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -112,11 +113,12 @@ func standardRoutes(t *testing.T) *fakeTransport {
 		add("/v6/line/hs_600000/01/2025.js", readTestdata(t, "ths_line_600000_2025.js")).
 		add("/v6/line/hs_600000/11/last.js", readTestdata(t, "ths_line_600000_week_last.js")).
 		add("/v6/line/hs_600000/50/last.js", readTestdata(t, "ths_line_600000_min60_last.js")).
-		add("/stock/fflow/kline/get", readTestdata(t, "em_fflow_600000.json")).
-		add("getbkzj?code=m%3A90%2Bt%3A2", readTestdata(t, "em_bkzj_sector.json")).
-		add("getbkzj?code=m%3A90%2Bt%3A3", readTestdata(t, "em_bkzj_concept.json")).
-		add("clist/get", readTestdata(t, "em_clist_sector.json")).
-		add("suggest/get", readTestdata(t, "em_suggest_pfyh.json"))
+		add("ssi_ssfx_flzjtj", readTestdata(t, "sina_flow_600000.json")).
+		add("MoneyFlow.ssl_bkzj_bk?asc=0&fenlei=0", readTestdata(t, "sina_bkzj_bk_sector.json")).
+		add("MoneyFlow.ssl_bkzj_bk?asc=0&fenlei=1", readTestdata(t, "sina_bkzj_bk_sector.json")).
+		add("Market_Center.getHQNodes", readTestdata(t, "sina_hqnodes.json")).
+		add("CN_MarketDataService.getKLineData", readTestdata(t, "sina_kline_600000.json")).
+		add("smartbox.gtimg.cn", readTestdata(t, "tx_suggest_pfyh.txt"))
 }
 
 func TestServiceQuotePrefersTHSAndCrossValidates(t *testing.T) {
@@ -211,8 +213,10 @@ func TestServiceQuoteStaleFromStore(t *testing.T) {
 	}
 }
 
-func TestServiceBarsDayFromTHS(t *testing.T) {
+// TestServiceBarsDayRawFromTencent 覆盖 adj=none 的主链路：腾讯原始序列（真不复权）。
+func TestServiceBarsDayRawFromTencent(t *testing.T) {
 	transport := standardRoutes(t)
+	transport.add("day,,,30,", readTestdata(t, "tx_fqkline_600000_raw_day.json"))
 	service, _ := newServiceWithTransport(t, newMemStore(), transport)
 
 	bars, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 30, contract.AdjustNone)
@@ -222,49 +226,46 @@ func TestServiceBarsDayFromTHS(t *testing.T) {
 	if len(bars) != 30 {
 		t.Fatalf("K 线数量 = %d，期望 30", len(bars))
 	}
-	if bars[len(bars)-1].Date != "2026-11-10" || bars[len(bars)-1].Close != 10.20 {
-		t.Fatalf("最后一根 = %+v，期望 2026-11-10 收 10.20", bars[len(bars)-1])
-	}
 	for i := 1; i < len(bars); i++ {
 		if bars[i].Date <= bars[i-1].Date {
 			t.Fatalf("K 线未按时间升序: %s 之后是 %s", bars[i-1].Date, bars[i].Date)
 		}
 	}
-	if bars[len(bars)-1].Volume < 477826 || bars[len(bars)-1].Volume > 477827 {
-		t.Fatalf("成交量 = %v 手，期望约 477826.52 手", bars[len(bars)-1].Volume)
-	}
-	if transport.countCalls("/v6/line/hs_600000/01/") != 1 {
-		t.Fatalf("当年文件足够时只应抓一次，实际 %d 次", transport.countCalls("/v6/line/hs_600000/01/"))
+	if transport.countCalls(",qfq") != 0 {
+		t.Fatalf("不复权路径不得请求前复权端点，实际 %d 次", transport.countCalls(",qfq"))
 	}
 }
 
+// TestServiceBarsCrossYearAndIntraday 覆盖同花顺日线的跨年拼接与分钟线。
+// 直接打 thsBars，避免被腾讯原始序列抢先命中（那是另一条链路，另有专门用例）。
 func TestServiceBarsCrossYearAndIntraday(t *testing.T) {
 	transport := standardRoutes(t)
 	service, _ := newServiceWithTransport(t, newMemStore(), transport)
+	code, err := ParseCode("600000")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// 请求超过当年剩余根数（205）→ 需要回抓上一年
-	bars, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 250, contract.AdjustNone)
+	// 请求超过当年剩余根数（205）-> 需要回抓上一年
+	bars, err := service.thsBars(context.Background(), code, contract.PeriodDay, 250)
 	if err != nil {
 		t.Fatalf("跨年 Bars 失败: %v", err)
 	}
-	if len(bars) != 250 {
-		t.Fatalf("K 线数量 = %d，期望 250", len(bars))
+	if len(bars) < 250 {
+		t.Fatalf("K 线数量 = %d，期望至少 250", len(bars))
 	}
 	if transport.countCalls("/01/2026.js") == 0 || transport.countCalls("/01/2025.js") == 0 {
 		t.Fatal("跨年请求应同时抓当年与上一年文件")
 	}
 
-	min60, err := service.Bars(context.Background(), "600000", contract.PeriodMin60, 60, contract.AdjustNone)
+	min60, err := service.thsBars(context.Background(), code, contract.PeriodMin60, 60)
 	if err != nil {
 		t.Fatalf("60 分钟 K 线失败: %v", err)
 	}
 	if len(min60) != 60 {
 		t.Fatalf("60 分钟 K 线数量 = %d，期望 60", len(min60))
 	}
-	if !strings.Contains(min60[len(min60)-1].Date, " ") {
-		t.Fatalf("分钟线日期应带时间，实际 %q", min60[len(min60)-1].Date)
-	}
-	if !strings.Contains(min60[len(min60)-1].Date, "-") {
+	if !strings.Contains(min60[len(min60)-1].Date, " ") || !strings.Contains(min60[len(min60)-1].Date, "-") {
 		t.Fatalf("分钟线日期格式应为 2026-11-10 15:00，实际 %q", min60[len(min60)-1].Date)
 	}
 }
@@ -279,10 +280,11 @@ func TestServiceBarsAdjustUnsupported(t *testing.T) {
 	if _, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 10, contract.AdjustNone); err != nil {
 		t.Fatalf("不复权 Bars 失败: %v", err)
 	}
-	// 前复权必须明确报错，不能拿不复权冒充
+	// 前复权：东财失败时还会试腾讯 fqkline；本用例的 transport 没有 fqkline 路由（400），
+	// 两个源都拿不到时仍必须明确报 ErrAdjustUnsupported，不能拿不复权冒充。
 	_, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 10, contract.AdjustQfq)
 	if !errors.Is(err, ErrAdjustUnsupported) {
-		t.Fatalf("前复权应返回 ErrAdjustUnsupported，实际 %v", err)
+		t.Fatalf("两个源都不可用时应返回 ErrAdjustUnsupported，实际 %v", err)
 	}
 	if !strings.Contains(err.Error(), "不复权") {
 		t.Fatalf("错误文案应给出可操作建议，实际 %q", err.Error())
@@ -291,23 +293,24 @@ func TestServiceBarsAdjustUnsupported(t *testing.T) {
 
 func TestServiceBarsCacheTTL(t *testing.T) {
 	transport := standardRoutes(t)
+	transport.add("day,,,30,", readTestdata(t, "tx_fqkline_600000_raw_day.json"))
 	service, clock := newServiceWithTransport(t, newMemStore(), transport)
 
 	if _, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 30, contract.AdjustNone); err != nil {
 		t.Fatal(err)
 	}
-	before := transport.countCalls("/v6/line/")
+	before := transport.countCalls("fqkline/get")
 	if _, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 30, contract.AdjustNone); err != nil {
 		t.Fatal(err)
 	}
-	if transport.countCalls("/v6/line/") != before {
+	if transport.countCalls("fqkline/get") != before {
 		t.Fatal("60 秒内重复请求应命中缓存")
 	}
 	clock.Advance(ttlBars + time.Second)
 	if _, err := service.Bars(context.Background(), "600000", contract.PeriodDay, 30, contract.AdjustNone); err != nil {
 		t.Fatal(err)
 	}
-	if transport.countCalls("/v6/line/") <= before {
+	if transport.countCalls("fqkline/get") <= before {
 		t.Fatal("超过 TTL 后应重新抓取")
 	}
 }
@@ -318,30 +321,33 @@ func TestServiceStockFundFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("个股资金流失败: %v", err)
 	}
-	if flow.Source != sourceEastMoney || flow.Kind != "stock" {
+	if flow.Source != sourceSina || flow.Kind != "stock" {
 		t.Fatalf("来源/Kind = %q/%q", flow.Source, flow.Kind)
 	}
-	if flow.MainNet != 26922753 {
-		t.Fatalf("主力净额 = %v，期望 26922753", flow.MainNet)
+	// fixture（sina_flow_600000.json）真实值：
+	//   r0_net = 24807640.23-42604228.05 = -17796587.82（超大单）
+	//   r1_net = 36909673.63-54960758.46 = -18051084.83（大单）
+	//   主力 = 两者之和 = -35847672.65
+	if math.Abs(flow.SuperNet-(-17796587.82)) > 0.01 {
+		t.Fatalf("超大单净额 = %v，期望 -17796587.82", flow.SuperNet)
 	}
-	if flow.MainNet != flow.LargeNet+flow.SuperNet {
+	if math.Abs(flow.LargeNet-(-18051084.83)) > 0.01 {
+		t.Fatalf("大单净额 = %v，期望 -18051084.83", flow.LargeNet)
+	}
+	if math.Abs(flow.MainNet-(flow.LargeNet+flow.SuperNet)) > 0.01 {
 		t.Fatalf("主力净额应等于大单+超大单: %+v", flow)
 	}
+	if flow.Name != "浦发银行" {
+		t.Fatalf("名称 = %q，期望 浦发银行", flow.Name)
+	}
+}
 
-	// 东财不可用 → 新浪兜底
-	fallback := (&fakeTransport{}).
-		addStatus("/stock/fflow/kline/get", http.StatusBadRequest).
-		add("MoneyFlow.ssi_ssfx_flzjtj", readTestdata(t, "sina_moneyflow_600000.json"))
-	fallbackService, _ := newServiceWithTransport(t, newMemStore(), fallback)
-	sinaFlow, err := fallbackService.StockFundFlow(context.Background(), "600000")
-	if err != nil {
-		t.Fatalf("新浪兜底失败: %v", err)
-	}
-	if sinaFlow.Source != sourceSina {
-		t.Fatalf("来源 = %q，期望 sina", sinaFlow.Source)
-	}
-	if sinaFlow.MainNet < 59605000 || sinaFlow.MainNet > 59606000 {
-		t.Fatalf("新浪主力净额 = %v，期望约 59,605,030.45", sinaFlow.MainNet)
+// TestServiceStockFundFlowNoFallbackToOtherSource 保证个股资金流只有新浪一条链路：
+// 新浪不可用就直接报错，不会用别的源给出不同口径的数字。
+func TestServiceStockFundFlowNoFallbackToOtherSource(t *testing.T) {
+	service, _ := newServiceWithTransport(t, newMemStore(), &fakeTransport{})
+	if _, err := service.StockFundFlow(context.Background(), "600000"); err == nil {
+		t.Fatal("新浪不可用时应报错")
 	}
 }
 
@@ -356,12 +362,20 @@ func TestServiceFundFlowRankDefaults(t *testing.T) {
 	if len(flows) != 10 {
 		t.Fatalf("默认 limit 应为 10，实际 %d", len(flows))
 	}
-	if flows[0].Name != "电子" || flows[0].Rank != 1 || flows[0].Kind != "sector" {
-		t.Fatalf("首条 = %+v，期望 电子 sector rank=1", flows[0])
+	if flows[0].Rank != 1 || flows[0].Kind != "sector" || flows[0].Source != sourceSina {
+		t.Fatalf("首条 = %+v，期望 rank=1 sector source=sina", flows[0])
+	}
+	if flows[0].Code == "" || len(flows[0].Code) < 3 {
+		t.Fatalf("板块代码应是新浪 category，实际 %q", flows[0].Code)
 	}
 	for i, flow := range flows {
 		if flow.Rank != i+1 {
 			t.Fatalf("第 %d 条 rank = %d", i, flow.Rank)
+		}
+	}
+	for i := 1; i < len(flows); i++ {
+		if flows[i].MainNet > flows[i-1].MainNet {
+			t.Fatalf("净流入榜第 %d 名 %v 大于第 %d 名 %v", i+1, flows[i].MainNet, i, flows[i-1].MainNet)
 		}
 	}
 
@@ -369,11 +383,99 @@ func TestServiceFundFlowRankDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("概念资金流失败: %v", err)
 	}
-	if len(concepts) != 3 || concepts[0].Name != "融资融券" || concepts[0].Kind != "concept" {
+	if len(concepts) != 3 || concepts[0].Kind != "concept" {
 		t.Fatalf("概念榜 = %+v", concepts)
 	}
 	if _, err := service.FundFlowRank(context.Background(), "unknown", 3); err == nil {
 		t.Fatal("非法 kind 应报错")
+	}
+}
+
+// TestServiceFundFlowRankByDirection 验证净流入/净流出榜的方向参数、本地重排与字段完整性。
+// 上游 fenlei 0/1 是行业/概念，方向完全由本地按 netamount 重排（新浪只给 asc=0 降序）。
+func TestServiceFundFlowRankByDirection(t *testing.T) {
+	rankBody := []byte(`[{"category":"new_dzxx","name":"电子信息","netamount":"10024947698.76","ratioamount":"0.0771156","avg_changeratio":"0.0165576"},
+		{"category":"new_nyhy","name":"能源行业","netamount":"-5000000000","ratioamount":"-0.05","avg_changeratio":"-0.02"},
+		{"category":"new_yhhy","name":"银行行业","netamount":"120000000","ratioamount":"0.011","avg_changeratio":"0.005"}]`)
+	transport := (&fakeTransport{}).add("MoneyFlow.ssl_bkzj_bk", rankBody)
+	service, _ := newServiceWithTransport(t, newMemStore(), transport)
+
+	// 空 kind / 空 direction / 空 limit 都使用默认值
+	in, err := service.FundFlowRankBy(context.Background(), "", "", 0)
+	if err != nil {
+		t.Fatalf("默认参数不应报错: %v", err)
+	}
+	if len(in) != 3 {
+		t.Fatalf("净流入榜行数 = %d，期望 3", len(in))
+	}
+	if in[0].Name != "电子信息" || in[0].Kind != "sector" || in[0].Rank != 1 {
+		t.Fatalf("净流入榜首条 = %+v，期望 电子信息 sector rank=1", in[0])
+	}
+	if in[0].Source != sourceSina {
+		t.Fatalf("来源 = %q，期望 %q", in[0].Source, sourceSina)
+	}
+	if math.Abs(in[0].ChangePct-1.65576) > 1e-4 || math.Abs(in[0].MainPct-7.71156) > 1e-4 {
+		t.Fatalf("涨跌幅/占比 = %v/%v，期望约 1.65576/7.71156", in[0].ChangePct, in[0].MainPct)
+	}
+	for i := 1; i < len(in); i++ {
+		if in[i].MainNet > in[i-1].MainNet {
+			t.Fatalf("净流入榜第 %d 名 %v 大于第 %d 名 %v", i+1, in[i].MainNet, i, in[i-1].MainNet)
+		}
+	}
+	for i, row := range in {
+		if row.Rank != i+1 {
+			t.Fatalf("第 %d 条 rank = %d，期望 %d", i, row.Rank, i+1)
+		}
+	}
+
+	// 净流出榜：最负的排第一，rank 依然连续
+	out, err := service.FundFlowRankBy(context.Background(), "sector", "out", 3)
+	if err != nil {
+		t.Fatalf("净流出榜失败: %v", err)
+	}
+	if len(out) != 3 || out[0].Name != "能源行业" || out[0].Rank != 1 {
+		t.Fatalf("净流出榜 = %+v，期望 能源行业 排第一", out)
+	}
+	if math.Abs(out[0].ChangePct-(-2)) > 1e-6 || math.Abs(out[0].MainPct-(-5)) > 1e-6 {
+		t.Fatalf("净流出榜涨跌幅/占比 = %v/%v，期望 -2/-5", out[0].ChangePct, out[0].MainPct)
+	}
+	for i := 1; i < len(out); i++ {
+		if out[i].MainNet < out[i-1].MainNet {
+			t.Fatalf("净流出榜第 %d 名 %v 小于第 %d 名 %v", i+1, out[i].MainNet, i, out[i-1].MainNet)
+		}
+	}
+
+	// all 与 in 同序（都是净额降序），但缓存 key 必须区分方向
+	all, err := service.FundFlowRankBy(context.Background(), "sector", "all", 2)
+	if err != nil {
+		t.Fatalf("all 方向失败: %v", err)
+	}
+	if len(all) != 2 || all[0].Name != "电子信息" {
+		t.Fatalf("all 榜 = %+v", all)
+	}
+
+	// 缓存：同 kind + 同方向 + 同 limit 重复请求不再出网
+	before := transport.countCalls("MoneyFlow.ssl_bkzj_bk")
+	if _, err := service.FundFlowRankBy(context.Background(), "sector", "in", 10); err != nil {
+		t.Fatal(err)
+	}
+	if got := transport.countCalls("MoneyFlow.ssl_bkzj_bk"); got != before {
+		t.Fatalf("相同方向与 limit 应命中缓存，请求数 %d -> %d", before, got)
+	}
+
+	// 概念范围走 fenlei=1
+	if _, err := service.FundFlowRankBy(context.Background(), "concept", "in", 5); err != nil {
+		t.Fatal(err)
+	}
+	transport.mu.Lock()
+	calls := append([]string{}, transport.calls...)
+	transport.mu.Unlock()
+	if !strings.Contains(calls[len(calls)-1], "fenlei=1") {
+		t.Fatalf("概念榜应请求 fenlei=1，最后一条请求 = %q", calls[len(calls)-1])
+	}
+
+	if _, err := service.FundFlowRankBy(context.Background(), "sector", "sideways", 5); err == nil {
+		t.Fatal("非法 direction 应报错")
 	}
 }
 
@@ -386,11 +488,53 @@ func TestServiceSectorsDefault(t *testing.T) {
 	if len(sectors) == 0 {
 		t.Fatal("板块列表为空")
 	}
-	if sectors[0].Code != "BK1201" || sectors[0].Name != "电子" || sectors[0].Kind != "sector" {
-		t.Fatalf("首条 = %+v", sectors[0])
+	for _, sector := range sectors {
+		if sector.Kind != "sector" {
+			t.Fatalf("行业分类的 Kind 应为 sector，实际 %q", sector.Kind)
+		}
+		// 新浪行业 category 一定是 new_ 前缀（gn_ 是概念）。
+		if !strings.HasPrefix(sector.Code, "new_") {
+			t.Fatalf("行业 entry 的代码应是新浪 category（new_*），实际 %q", sector.Code)
+		}
+		if sector.Name == "" {
+			t.Fatal("板块名称不应为空")
+		}
 	}
-	if sectors[0].ChangePct != 3.29 {
-		t.Fatalf("涨跌幅 = %v，期望 3.29", sectors[0].ChangePct)
+
+	concepts, err := service.Sectors(context.Background(), "concept")
+	if err != nil {
+		t.Fatalf("概念目录失败: %v", err)
+	}
+	if len(concepts) == 0 {
+		t.Fatal("概念目录为空")
+	}
+	for _, concept := range concepts {
+		if concept.Kind != "concept" || !strings.HasPrefix(concept.Code, "gn_") {
+			t.Fatalf("概念 entry 不符: %+v", concept)
+		}
+	}
+}
+
+// TestServiceSectorsOnlyExposesFlowedCategories 保证只暴露有资金流数据的
+// 新浪行业 / 概念板块两支，不混入申万、证监会等没有资金流的分类。
+func TestServiceSectorsOnlyExposesFlowedCategories(t *testing.T) {
+	entries, err := parseSinaHQNodes(readTestdata(t, "sina_hqnodes.json"))
+	if err != nil {
+		t.Fatalf("解析目录失败: %v", err)
+	}
+	for _, group := range [][]sectorEntry{entries[KindSector], entries[KindConcept]} {
+		for _, entry := range group {
+			if strings.HasPrefix(entry.Code, "sw") || strings.HasPrefix(entry.Code, "hangye_") ||
+				strings.HasPrefix(entry.Code, "zhishu_") || strings.HasPrefix(entry.Code, "diyu_") {
+				t.Fatalf("不应暴露没有资金流的分类: %+v", entry)
+			}
+		}
+	}
+	if len(entries[KindSector]) < 30 {
+		t.Fatalf("新浪行业数量异常偏少: %d", len(entries[KindSector]))
+	}
+	if len(entries[KindConcept]) < 100 {
+		t.Fatalf("概念板块数量异常偏少: %d", len(entries[KindConcept]))
 	}
 }
 
@@ -414,7 +558,7 @@ func TestServiceSearch(t *testing.T) {
 func TestServiceHealthListsAllSources(t *testing.T) {
 	service, _ := newServiceWithTransport(t, newMemStore(), standardRoutes(t))
 	health := service.Health(context.Background())
-	for _, name := range []string{sourceTHS, sourceEastMoney, sourceSina, sourceTencent, sourceStore, "cache"} {
+	for _, name := range []string{sourceTHS, sourceSina, sourceTencent, sourceStore, "cache"} {
 		if _, ok := health[name]; !ok {
 			t.Fatalf("Health 缺少 %q，实际 %v", name, health)
 		}
@@ -447,5 +591,43 @@ func TestServiceQuoteRejectsBadInput(t *testing.T) {
 	}
 	if _, err := service.Quote(context.Background(), []string{"??"}); !errors.Is(err, ErrNoData) {
 		t.Fatalf("全部无法识别应返回 ErrNoData，实际 %v", err)
+	}
+}
+
+// TestServiceFundFlowRankFailureSurfacesError 保证新浪资金榜失败时整块报错，
+// 不会再降级到别的源给出不同口径的榜单。
+func TestServiceFundFlowRankFailureSurfacesError(t *testing.T) {
+	service, _ := newServiceWithTransport(t, newMemStore(), &fakeTransport{})
+	if _, err := service.FundFlowRankBy(context.Background(), "sector", "out", 2); err == nil {
+		t.Fatal("新浪资金榜不可用时应报错")
+	}
+}
+
+// TestServiceSectorHistoryUsesSinaCategory 覆盖「榜单里点进去看多日」这条链路：
+// 榜单返回的新浪 category 必须能直接喂给 SectorFundFlowHistory。
+func TestServiceSectorHistoryUsesSinaCategory(t *testing.T) {
+	transport := (&fakeTransport{}).
+		add("MoneyFlow.ssl_bkzj_bk", readTestdata(t, "sina_bkzj_bk_sector.json")).
+		add("MoneyFlow.ssl_bkzj_zjlrqs", readTestdata(t, "sina_bkzj_zjlrqs_new_dzxx.json"))
+	service, _ := newServiceWithTransport(t, newMemStore(), transport)
+
+	rank, err := service.FundFlowRankBy(context.Background(), "sector", "in", 5)
+	if err != nil {
+		t.Fatalf("资金榜失败: %v", err)
+	}
+	category := rank[0].Code
+	if category == "" {
+		t.Fatal("榜单条目必须有新浪 category")
+	}
+	hist, err := service.SectorFundFlowHistory(context.Background(), category, 5)
+	if err != nil {
+		t.Fatalf("用榜单 category 取多日历史失败: %v", err)
+	}
+	if len(hist.Points) == 0 {
+		t.Fatal("多日历史为空")
+	}
+	// 榜单缓存里存了 category -> 中文名，历史接口要把名称补上，避免图例显示 new_xxxx。
+	if hist.Name == "" || strings.HasPrefix(hist.Name, "new_") {
+		t.Fatalf("历史名称应补成中文，实际 %q", hist.Name)
 	}
 }

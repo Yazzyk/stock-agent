@@ -23,6 +23,16 @@ type fakeData struct {
 	listErr    error
 	syncErr    error
 	searchRefs []contract.StockRef
+
+	// 同步诊断扩展（syncDiagnoser）
+	check       contract.SyncCheck
+	checkErr    error
+	saveCount   int
+	saveErr     error
+	savedCookie string
+	capture     string
+	captureSrc  string
+	captureErr  error
 }
 
 func (f *fakeData) Quote(_ context.Context, codes []string) ([]contract.Quote, error) {
@@ -74,6 +84,39 @@ func (f *fakeData) SyncTHSWatchlist(context.Context) (contract.SyncResult, error
 
 func (f *fakeData) Search(context.Context, string) ([]contract.StockRef, error) {
 	return f.searchRefs, nil
+}
+
+// 以下四个方法让 fakeData 满足插件内部的 syncDiagnoser（结构化断言，不需要 import datasource）。
+
+func (f *fakeData) SyncCheck(context.Context) (contract.SyncCheck, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.checkErr != nil {
+		return contract.SyncCheck{}, f.checkErr
+	}
+	return f.check, nil
+}
+
+func (f *fakeData) VerifyTHSCookie(context.Context, string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveCount, f.saveErr
+}
+
+func (f *fakeData) SaveTHSCookie(_ context.Context, cookie string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.savedCookie = cookie
+	if f.saveErr != nil {
+		return 0, f.saveErr
+	}
+	return f.saveCount, nil
+}
+
+func (f *fakeData) CaptureBrowserTHSCookie() (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.capture, f.captureSrc, f.captureErr
 }
 
 func (f *fakeData) Health(context.Context) map[string]string { return map[string]string{} }
@@ -166,10 +209,10 @@ func TestManifestAndActivate(t *testing.T) {
 		t.Fatalf("激活失败: %v", err)
 	}
 	methods := ctx.Methods.List()
-	if len(methods) != 5 {
-		t.Fatalf("方法数 = %d，期望 5", len(methods))
+	if len(methods) != 9 {
+		t.Fatalf("方法数 = %d，期望 9", len(methods))
 	}
-	for _, want := range []string{"list", "sync", "add", "remove", "groups"} {
+	for _, want := range []string{"list", "sync", "add", "remove", "groups", "check", "saveCookie", "captureCookie", "privacy"} {
 		if _, ok := ctx.Methods.Get(want); !ok {
 			t.Fatalf("缺少方法 %q", want)
 		}

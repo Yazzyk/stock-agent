@@ -1,6 +1,11 @@
 // 演示数据桥：浏览器直开（npm run dev，无 Wails 注入）时替代 window.go。
 // 形状严格对齐 docs/API.md，真实 Wails 环境不会加载本文件。
 
+import { installAgentMocks } from './mocks/agent'
+import { installFuyaoMocks, fuyaoMock } from './mocks/fuyao'
+import { installMarketMocks } from './mocks/market'
+import { dispatchMock, setMockEmitter } from './mocks/registry'
+import { installSettingsMocks } from './mocks/settings'
 import type {
   AgentRunResult,
   AgentSession,
@@ -221,7 +226,7 @@ const PLUGINS: PluginView[] = [
       tool('watchdog.test', '试运行 Watch 规则', '只求值不触发，返回场景与渲染后的 prompt', ['watch'], 'read'),
       tool('watchdog.logs', 'Watch 触发日志', '最近的命中与派发记录', ['watch'], 'read'),
     ],
-    ui: [{ id: 'watch', title: 'Watch 哨兵', group: '研究', component: 'watch', order: 35, owner: 'watch' }],
+    ui: [{ id: 'watch', title: 'Watch 哨兵', icon: 'radar', group: '研究', component: 'watch', order: 35, owner: 'watch' }],
     methods: [
       { name: 'list', description: '规则/状态/指标/日志' },
       { name: 'save', description: '新增或更新规则' },
@@ -245,11 +250,16 @@ const PLUGINS: PluginView[] = [
       tool('watch.sync', '同步同花顺', '从本机同花顺客户端或网页同步自选', ['watch'], 'read'),
       tool('market.quote', '行情快照', '按代码批量取现价涨跌幅成交额', ['market'], 'network'),
       tool('market.search', '股票搜索', '按代码或名称搜索 A 股标的', ['market'], 'read'),
+      tool('watch.check', '同步诊断', '检查本机同花顺/网页登录/手工文件三种来源', ['watch'], 'read'),
     ],
-    ui: [{ id: 'ui.watchlist', title: '自选股', group: '行情', component: 'watchlist', order: 10, owner: 'watchlist' }],
+    ui: [{ id: 'ui.watchlist', title: '自选股', icon: 'star', group: '行情', component: 'watchlist', order: 10, owner: 'watchlist' }],
     methods: [
       { name: 'list', description: '自选列表' },
       { name: 'sync', description: '同步同花顺自选' },
+      { name: 'check', description: '同步前置诊断' },
+      { name: 'saveCookie', description: '保存并验证网页登录态' },
+      { name: 'captureCookie', description: '从本机浏览器抓取登录态' },
+      { name: 'privacy', description: '完全磁盘访问设置入口' },
       { name: 'add', description: '加入自选' },
       { name: 'remove', description: '移出自选' },
       { name: 'groups', description: '分组列表' },
@@ -265,12 +275,15 @@ const PLUGINS: PluginView[] = [
       tool('flow.stock', '个股资金流', '主力/超大/大/中/小单净额', ['flow', 'market'], 'network'),
       tool('flow.rank', '资金流排名', '板块或概念按主力净额排名', ['flow'], 'network'),
       tool('sector.list', '板块列表', '行业与概念板块涨跌幅', ['flow', 'market'], 'read'),
+      tool('flow.history', '多日资金流', '个股近 N 日主力/超大/大/中/小单净额与收盘价', ['flow', 'market'], 'network'),
     ],
-    ui: [{ id: 'ui.fundflow', title: '资金流', group: '行情', component: 'fundflow', order: 20, owner: 'fundflow' }],
+    ui: [{ id: 'ui.fundflow', title: '资金流', icon: 'waves', group: '行情', component: 'fundflow', order: 20, owner: 'fundflow' }],
     methods: [
       { name: 'stock', description: '个股资金流' },
       { name: 'rank', description: '板块/概念排名' },
       { name: 'sectors', description: '板块列表' },
+      { name: 'history', description: '个股多日资金流' },
+      { name: 'batch', description: '批量资金流快照' },
     ],
   },
   {
@@ -283,23 +296,78 @@ const PLUGINS: PluginView[] = [
       tool('market.bars', 'K 线序列', '按代码与周期取前复权 K 线', ['market'], 'network'),
       tool('kline.analyze', 'K 线分析', '均线与形态摘要', ['market', 'quant'], 'read'),
     ],
-    ui: [{ id: 'ui.kline', title: 'K 线', group: '行情', component: 'kline', order: 30, owner: 'kline' }],
+    ui: [{ id: 'ui.kline', title: 'K 线', icon: 'candles', group: '行情', component: 'kline', order: 30, owner: 'kline' }],
     methods: [
       { name: 'bars', description: 'K 线数据' },
       { name: 'analyze', description: 'K 线分析' },
     ],
   },
   {
+    id: 'fuyao',
+    name: '数据源 · 同花顺',
+    version: '1.0.0',
+    description: '同花顺官方数据 API：行情/K线/估值/涨跌停/热榜/龙虎榜/竞价/财务/指数/基金/期货期权/资讯',
+    active: true,
+    tags: ['market', 'datasource', 'fuyao'],
+    tools: [
+      tool('fuyao.catalog', '同花顺官方数据目录', '查 124 个端点的 ID、路径、参数、上限与权限', ['fuyao', 'meta'], 'network'),
+      tool('fuyao.api', '同花顺官方通用查询', '查询目录里的任意官方端点（长尾能力兜底）', ['fuyao', 'datasource'], 'network'),
+      tool('fuyao.quote', '官方行情快照', '批量取最新价/涨跌幅/量额（一次 50 个）', ['fuyao', 'market'], 'network'),
+      tool('fuyao.kline', '官方历史 K 线', '批量历史 K 线（股票/指数/基金，10/批）', ['fuyao', 'market'], 'network'),
+      tool('fuyao.valuation', '官方估值快照', 'PE/PB/PS/PCF 批量估值', ['fuyao', 'market'], 'network'),
+      tool('fuyao.limitPool', '涨跌停/炸板池', '涨停池含连板数、封单额、涨停原因', ['fuyao', 'market'], 'network'),
+      tool('fuyao.hotRank', '同花顺热榜', '飙升榜/热股榜/历史热股榜', ['fuyao', 'market'], 'network'),
+      tool('fuyao.capitalFlow', '主力资金流', '资金流实时/历史/高频（客户端专用会降级）', ['fuyao', 'flow'], 'network'),
+      tool('fuyao.auction', '集合竞价', '竞价快照/风向标/机会', ['fuyao', 'market'], 'network'),
+      tool('fuyao.special', '特色数据', '异动/龙虎榜/营业部/筹码/新增概念', ['fuyao', 'market'], 'network'),
+      tool('fuyao.financials', '财务报表与指标', '三大报表与五类财务指标', ['fuyao', 'fundamental'], 'network'),
+      tool('fuyao.tickerSearch', '标的检索', '按代码或名称检索官方标的', ['fuyao', 'meta'], 'network'),
+      tool('fuyao.calendar', '交易日历', '官方交易日历（yyyyMMdd + 毫秒戳）', ['fuyao', 'meta'], 'network'),
+      tool('fuyao.index', '指数与板块', '目录/成分股/反查/快照/K线', ['fuyao', 'market'], 'network'),
+      tool('fuyao.fund', '基金数据', '资料/净值/持仓/业绩/经理', ['fuyao', 'fund'], 'network'),
+      tool('fuyao.futures', '期货数据', '品种/合约/持仓/基差/时间轴', ['fuyao', 'futures'], 'network'),
+      tool('fuyao.options', '期权数据', '品种/合约/分时/时间轴', ['fuyao', 'options'], 'network'),
+      tool('fuyao.news', '资讯', '快讯/公告/专题/个股新闻/异动解读', ['fuyao', 'news'], 'network'),
+      tool('fuyao.ipo', '打新日历', 'A 股/港股打新日历与发行详情', ['fuyao', 'ipo'], 'network'),
+      tool('fuyao.marketDump', '全市场导出', '全市场 Parquet 下载链接（有时效）', ['fuyao', 'datasource'], 'network'),
+    ],
+    ui: [{ id: 'fuyao', title: '数据源', icon: 'database', group: '行情', component: 'fuyao', order: 16, owner: 'fuyao' }],
+    methods: [
+      { name: 'catalog', description: '官方端点目录（离线）' },
+      { name: 'query', description: '通用查询' },
+      { name: 'quote', description: '批量行情快照' },
+      { name: 'kline', description: '批量历史 K 线' },
+      { name: 'valuation', description: '估值快照' },
+      { name: 'limitPool', description: '涨跌停/炸板池' },
+      { name: 'limitStats', description: '涨停强度统计' },
+      { name: 'hotRank', description: '同花顺热榜' },
+      { name: 'special', description: '特色数据' },
+      { name: 'auction', description: '集合竞价' },
+      { name: 'capitalFlow', description: '主力资金流' },
+      { name: 'financials', description: '三大报表/财务指标' },
+      { name: 'tickerSearch', description: '标的检索' },
+      { name: 'calendar', description: '交易日历' },
+      { name: 'index', description: '指数/板块' },
+      { name: 'fund', description: '基金视图' },
+      { name: 'futures', description: '期货视图' },
+      { name: 'options', description: '期权视图' },
+      { name: 'news', description: '资讯视图' },
+      { name: 'ipo', description: '打新视图' },
+      { name: 'marketDump', description: '全市场导出链接' },
+    ],
+  },
+  {
     id: 'agentlab',
     name: 'Agent 实验室',
     version: '0.1.0',
-    description: '盘前/盯盘/复盘/量化/对话五个 worker',
+    description: 'RouterAgent 唯一对话入口 + 按需生成的任务 worker',
     active: true,
     tools: [
       tool('agent.run', '启动 Agent', '按 worker 运行一次研究任务', ['agent'], 'write'),
       tool('agent.status', 'Agent 状态', '当前运行状态', ['agent'], 'read'),
+      tool('agent.spawn', '派生子智能体', '把独立子任务交给子智能体并回收结论', ['agent'], 'write'),
     ],
-    ui: [{ id: 'ui.agentlab', title: 'Agent 实验室', group: '研究', component: 'agentlab', order: 40, owner: 'agentlab' }],
+    ui: [{ id: 'ui.agentlab', title: 'Agent 实验室', icon: 'robot', group: '研究', component: 'agentlab', order: 40, owner: 'agentlab' }],
     methods: [
       { name: 'workers', description: 'worker 列表' },
       { name: 'run', description: '启动 worker' },
@@ -307,6 +375,13 @@ const PLUGINS: PluginView[] = [
       { name: 'stop', description: '停止运行' },
       { name: 'sessions', description: '历史会话' },
       { name: 'session', description: '会话详情' },
+      { name: 'templates', description: '值班模板' },
+      { name: 'saveTemplate', description: '保存提示词' },
+      { name: 'resetTemplate', description: '恢复默认提示词' },
+      { name: 'schedule', description: '自动值班计划' },
+      { name: 'setSchedule', description: '修改值班计划' },
+      { name: 'context', description: '上下文用量' },
+      { name: 'tree', description: '编队谱系' },
     ],
   },
   {
@@ -316,7 +391,7 @@ const PLUGINS: PluginView[] = [
     description: '日线回测与 walk-forward：T+1、涨跌停不可成交、四项成本',
     active: true,
     tools: [tool('quant.backtest', '回测策略', '对单只 A 股跑日线回测，返回收益/回撤/成本明细与报告', ['quant', 'research'], 'network')],
-    ui: [{ id: 'quant', title: '量化研究', group: '研究', component: 'quant', order: 45, owner: 'quant' }],
+    ui: [{ id: 'quant', title: '量化研究', icon: 'sigma', group: '研究', component: 'quant', order: 45, owner: 'quant' }],
     methods: [
       { name: 'strategies', description: '策略与参数定义' },
       { name: 'run', description: '单次回测' },
@@ -336,7 +411,7 @@ const PLUGINS: PluginView[] = [
       tool('skill.list', '技能列表', '列出可用技能', ['skill'], 'read'),
       tool('skill.view', '技能正文', '读取技能 Markdown', ['skill'], 'read'),
     ],
-    ui: [{ id: 'ui.knowledge', title: '知识库', group: '研究', component: 'knowledge', order: 50, owner: 'knowledge' }],
+    ui: [{ id: 'ui.knowledge', title: '知识库', icon: 'book', group: '研究', component: 'knowledge', order: 50, owner: 'knowledge' }],
     methods: [
       { name: 'list', description: '文档列表' },
       { name: 'search', description: '知识检索' },
@@ -353,12 +428,27 @@ const PLUGINS: PluginView[] = [
     description: 'Provider、BaseURL、模型与密钥',
     active: true,
     tools: [],
-    ui: [{ id: 'ui.modelsettings', title: '模型设置', group: '设置', component: 'modelsettings', order: 90, owner: 'modelsettings' }],
+    ui: [{ id: 'ui.modelsettings', title: '模型设置', icon: 'cpu', group: '设置', component: 'modelsettings', order: 90, owner: 'modelsettings' }],
     methods: [
       { name: 'list', description: '模型列表' },
       { name: 'save', description: '保存配置' },
       { name: 'test', description: '连通性测试' },
       { name: 'remove', description: '删除配置' },
+      { name: 'presets', description: '官方模型预设' },
+    ],
+  },
+  {
+    id: 'console',
+    name: '设置中心',
+    version: '0.1.0',
+    description: '插件安装与激活状态、工具索引、审计、安全策略与数据源健康',
+    active: true,
+    tools: [],
+    ui: [{ id: 'ui.console', title: '设置中心', icon: 'settings', group: '系统', component: 'console', order: 95, owner: 'console' }],
+    methods: [
+      { name: 'inventory', description: '插件/工具/状态清单' },
+      { name: 'setEnabled', description: '启用或停用插件（重启生效）' },
+      { name: 'policy', description: '安全策略只读视图' },
     ],
   },
 ]
@@ -369,24 +459,26 @@ let tick = 0
 
 const models: ModelInfo[] = [
   {
-    id: 'deepseek:deepseek-chat',
+    id: 'deepseek:deepseek-flash',
     provider: 'deepseek',
-    model: 'deepseek-chat',
-    displayName: 'DeepSeek Chat',
+    model: 'deepseek-flash',
+    displayName: 'DeepSeek Flash',
     baseUrl: 'https://api.deepseek.com',
     hasKey: true,
     isDefault: true,
     maxTokens: 8192,
+    contextWindow: 1000000,
   },
   {
-    id: 'openai-compat:gpt-4o-mini',
-    provider: 'openai-compat',
-    model: 'gpt-4o-mini',
-    displayName: 'OpenAI 兼容 · gpt-4o-mini',
+    id: 'openai:gpt-5-mini',
+    provider: 'openai',
+    model: 'gpt-5-mini',
+    displayName: 'OpenAI · gpt-5-mini',
     baseUrl: 'https://api.openai.com/v1',
     hasKey: false,
     isDefault: false,
-    maxTokens: 4096,
+    maxTokens: 16384,
+    contextWindow: 400000,
   },
 ]
 
@@ -476,7 +568,7 @@ function quoteOf(s: DemoStock): Quote {
     turnover: s.turnover,
     amplitude: round2(Math.abs(s.pct) * 1.4 + 0.5),
     time: nowISO(),
-    source: 'eastmoney',
+    source: 'sina',
     stale: false,
   }
 }
@@ -499,7 +591,7 @@ function rankData(kind: 'sector' | 'concept'): FundFlow[] {
     mainNet: Math.round(main),
     changePct: pct,
     rank: i + 1,
-    source: 'eastmoney',
+    source: 'sina',
   }))
 }
 
@@ -530,7 +622,7 @@ function flowOf(code: string): FundFlow {
     smallNet: Math.round(-main * 0.22),
     mainPct: round2((rand() - 0.4) * 8),
     changePct: round2((rand() - 0.45) * 6),
-    source: 'eastmoney',
+    source: 'sina',
   }
 }
 
@@ -592,6 +684,13 @@ function emit(topic: string, payload: Record<string, unknown>): void {
   kernelListener({ topic, time: nowISO(), payload: JSON.stringify(payload) })
 }
 
+// 演示扩展：各面板通过 mocks/registry 注册，避免改同一份 mock。
+installMarketMocks()
+installAgentMocks()
+installSettingsMocks()
+installFuyaoMocks()
+setMockEmitter(emit)
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms)
@@ -631,15 +730,119 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   startSteerDrain()
   const wantsWatchRule = /watchdog\.create/.test(input)
   const createdRule = wantsWatchRule ? watchCreateFromDescription(input) : null
+  // 双工演示：RouterAgent 派发一个后台子智能体（编队 + 前台播报都能看到）。
+  const childId = id + '-child'
+  const duplex = worker === 'router' && input.trim() !== ''
+  const childStartedAt = new Date().toISOString()
   emit('agent.state', { sessionId: id, state: 'thinking', detail: '准备上下文' })
   for (let i = 0; i < DELTA_STEPS.length; i++) {
     if (stopped) break
     // 每步 520ms：留出足够的插话窗口（真实环境由模型推理时长决定）
     await sleep(520)
     emit('agent.delta', { sessionId: id, text: DELTA_STEPS[i] ?? '' })
+    if (i === 2 && duplex) {
+      // 派发：progress（前台播报）+ child（编队节点）成对发出。
+      emit('agent.progress', { sessionId: id, childSessionId: childId, label: '盘前计划', worker: 'premarket', status: 'running', phase: 'started' })
+      emit('agent.child', {
+        parentSessionId: id,
+        childSessionId: childId,
+        label: '盘前计划',
+        worker: 'premarket',
+        status: 'running',
+        phase: 'started',
+        tokens: 0,
+        elapsedMs: 0,
+        startedAt: childStartedAt,
+        at: childStartedAt,
+        atMs: Date.now(),
+      })
+      emit('agent.state', { sessionId: id, state: 'waiting', detail: '等待后台子智能体结果…' })
+    }
     if (i === 5) emit('agent.state', { sessionId: id, state: 'tool', detail: 'flow.stock' })
   }
+  if (duplex && !stopped) {
+    const endedAt = new Date().toISOString()
+    emit('agent.progress', { sessionId: id, childSessionId: childId, label: '盘前计划', worker: 'premarket', status: 'ok', phase: 'finished', tokens: 6120, elapsedMs: 26000 })
+    emit('agent.child', {
+      parentSessionId: id,
+      childSessionId: childId,
+      label: '盘前计划',
+      worker: 'premarket',
+      status: 'ok',
+      phase: 'finished',
+      tokens: 6120,
+      elapsedMs: 26000,
+      startedAt: childStartedAt,
+      endedAt,
+      at: endedAt,
+      atMs: Date.now(),
+    })
+    emit('agent.state', { sessionId: id, state: 'thinking', detail: '子智能体结果已收到，正在汇总…' })
+  }
   if (!stopped) await sleep(900)
+  // 演示用：输入里带「模拟空回复」就走空正文 + 诊断分支，
+  // 这样不接真后端也能看到报告页的告警卡长什么样。
+  // 只空正文、不带诊断：验证「后端未返回诊断信息 + 已用步数/token」的兜底文案
+  if (/模拟空回复无诊断/.test(input)) {
+    const usage = { promptTokens: 9000, completionTokens: 640, totalTokens: 9640 }
+    const session: AgentSession = {
+      id,
+      worker,
+      title: '空回复（无诊断）· 演示',
+      startedAt: nowISO(),
+      status: 'ok',
+      tokens: usage.totalTokens,
+    }
+    sessions.unshift(session)
+    mockRunningSession = ''
+    stopSteerDrain()
+    emit('agent.report', { sessionId: id, worker, report: '', usage })
+    emit('agent.state', { sessionId: id, state: 'done', detail: '' })
+    return { sessionId: id, worker, report: '', steps: 3, usage }
+  }
+  if (/模拟空回复/.test(input)) {
+    const usage = { promptTokens: 12480, completionTokens: 8192, totalTokens: 20672 }
+    const session: AgentSession = {
+      id,
+      worker,
+      title: '空回复演示 · 演示',
+      startedAt: nowISO(),
+      status: 'ok',
+      tokens: usage.totalTokens,
+    }
+    sessions.unshift(session)
+    mockRunningSession = ''
+    stopSteerDrain()
+    emit('agent.report', {
+      sessionId: id,
+      worker,
+      report: '',
+      usage,
+      finishReason: 'length',
+      emptyReason: 'reasoning_only',
+      // 与后端契约一致：diagnostics 是 string[]
+      diagnostics: [
+        '检测到 reasoning_content 非空而 content 为空：该模型是推理模型，正文被推理占满',
+        'finish_reason=length：补全配额 8192 全部花在推理上，可见正文 0 token',
+        '建议把输出上限调到 8192，或换一个非推理模型',
+      ],
+    })
+    emit('agent.state', { sessionId: id, state: 'done', detail: '' })
+    return {
+      sessionId: id,
+      worker,
+      report: '',
+      steps: 4,
+      usage,
+      finishReason: 'length',
+      emptyReason: 'reasoning_only',
+      diagnostics: [
+        '检测到 reasoning_content 非空而 content 为空：该模型是推理模型，正文被推理占满',
+        'finish_reason=length：补全配额 8192 全部花在推理上，可见正文 0 token',
+        '建议把输出上限调到 8192，或换一个非推理模型',
+      ],
+    }
+  }
   const report = createdRule
     ? '# 已创建 Watch 规则\n\n- 规则：' + createdRule.name + '\n- 触发源：' +
       createdRule.sources.map((s) => (s.type === 'quote' || s.type === 'kline' ? s.type + ':' + (s.codes ?? []).join(',') : s.type === 'sector' ? '板块:' + (s.sector ?? '') : s.type === 'news' ? '新闻:' + (s.keyword ?? '') : '定时:' + (s.times ?? []).join(','))).join(' | ') +
@@ -658,7 +861,7 @@ async function mockRun(worker: string, input: string): Promise<AgentRunResult> {
   mockRunningSession = ''
   stopSteerDrain()
   if (!stopped) emit('agent.report', { sessionId: id, worker, report, usage })
-  emit('agent.state', { sessionId: id, state: stopped ? 'error' : 'done', detail: stopped ? '已手动停止' : '' })
+  emit('agent.state', { sessionId: id, state: stopped ? 'stopped' : 'done', detail: stopped ? '已手动停止' : '' })
   return { sessionId: id, worker, report, steps: 6, usage }
 }
 
@@ -822,9 +1025,14 @@ const WATCH_LOGS: WatchRunLog[] = [
     ruleId: 'w2c9e8d7a6b5',
     ruleName: '半导体板块资金异动',
     worker: 'chat',
-    triggered: false,
+    // 冷却/限频属于「主动跳过」，后端不写日志；这里演示的是真正的失败（模型调用超时），
+    // 免得把「冷却中」误标成「错误」。
+    triggered: true,
     matched: true,
-    error: '触发未派发：冷却中（600 秒内只派发一次）',
+    summary: 'sector.mainNetYi = 24.6 命中条件，已派发给 chat',
+    metrics: { 'sector.mainNetYi': 24.6 },
+    error: '模型调用失败：上游 30s 超时（已记入日志，本轮不重试）',
+    elapsedMs: 30000,
   },
 ]
 
@@ -1324,6 +1532,41 @@ function analyzeMock(code: string, period: string): unknown {
     ],
     support: [round2(ma20 * 0.995), round2(ma60)],
     resistance: [round2(close * 1.03), round2(close * 1.06)],
+    // 短线/长线双尺度：演示数据给两份结构一致的摘要，字段与后端 market.HorizonAnalysis 对齐。
+    horizons: [
+      {
+        key: 'short',
+        title: '短线（近 60 根）',
+        window: Math.min(60, bars.length),
+        bias: close > ma20 ? '偏多' : '偏空',
+        summary: {
+          trend: (close > ma20 ? '短线多头排列' : '短线转弱') + '，收盘 ' + close.toFixed(2) + ' 相对 MA20 ' + ma20.toFixed(2),
+          ma: 'MA5 ' + ma5.toFixed(2) + ' / MA20 ' + ma20.toFixed(2),
+          rsi: 'RSI14 ' + (52 + (seedOf(code) % 18)).toFixed(1) + '，中性偏强',
+          macd: 'DIF 在 DEA 上方，红柱缩短',
+          atr: 'ATR14 ' + (close * 0.021).toFixed(2) + '（约 2.1% 波动）',
+        },
+        patterns: [{ name: '放量突破', index: Math.max(0, bars.length - 8), confidence: 0.72, note: '量能 2.1 倍，收盘站上 MA20' }],
+        support: [round2(ma20 * 0.995)],
+        resistance: [round2(close * 1.03)],
+      },
+      {
+        key: 'long',
+        title: '长线（近 250 根）',
+        window: Math.min(250, bars.length),
+        bias: ma20 > ma60 ? '偏多' : '中性',
+        summary: {
+          trend: ma20 > ma60 ? '长线结构向上：MA20 位于 MA60 上方' : '长线震荡：MA20 与 MA60 纠缠',
+          ma: 'MA20 ' + ma20.toFixed(2) + ' / MA60 ' + ma60.toFixed(2),
+          rsi: 'RSI14 长期分位中性',
+          macd: '长周期 MACD 零轴附近',
+          atr: 'ATR14 ' + (close * 0.024).toFixed(2) + '（约 2.4% 波动）',
+        },
+        patterns: [{ name: '均线多头排列', index: Math.max(0, bars.length - 3), confidence: 0.64, note: 'MA20 > MA60' }],
+        support: [round2(ma60)],
+        resistance: [round2(close * 1.08)],
+      },
+    ],
   }
 }
 
@@ -1334,19 +1577,19 @@ export function createMockBridge(): GoBridge {
     started: true,
     plugins: PLUGINS.length,
     active: PLUGINS.length,
-    // 与真实后端一致：8 个插件共 27 个工具（演示桥只登记参与 UI 的一部分）
-    tools: 27,
+    // 演示桥只登记参与 UI 的工具；数字与 PLUGINS 保持一致，避免设置中心与状态栏对不上。
+    tools: PLUGINS.reduce((n, p) => n + p.tools.length, 0),
     ui: PLUGINS.length,
     services: ['agent.runtime', 'kb.store', 'kline.engine', 'llm', 'quant.engine', 'watch.engine'],
     policy: {
-      networkAllowlist: ['push2.eastmoney.com', 'd.10jqka.com.cn', 'qt.gtimg.cn', 'hq.sinajs.cn'],
+      networkAllowlist: ['d.10jqka.com.cn', 'qt.gtimg.cn', 'hq.sinajs.cn', 'vip.stock.finance.sina.com.cn'],
       pathRoots: ['~/.guanlan'],
       allowExec: false,
       maxReqPerMin: 60,
       maxToolCalls: 24,
-      maxTokensPerRun: 120000,
+      maxTokensPerRun: 0,
     },
-    dataHealth: { eastmoney: 'ok', ths: 'ok', sina: 'degraded', store: 'ok' },
+    dataHealth: { ths: 'ok', sina: 'ok', tencent: 'ok', store: 'ok' },
     time: nowISO(),
   }
 
@@ -1374,8 +1617,17 @@ export function createMockBridge(): GoBridge {
         case 'market.quote': {
           const codes = Array.isArray(a.codes) ? a.codes.filter((c): c is string => typeof c === 'string') : []
           tick += 1
+          // 演示自检：记录每次 market.quote 的入参条数，playwright 可断言「一次批量」
+          // （例如 window.__mockQuoteCalls === [12] 表示 12 只标的一次取完）。
+          const probe = window as unknown as { __mockQuoteCalls?: Array<{ codes: string[] }> }
+          probe.__mockQuoteCalls = [...(probe.__mockQuoteCalls ?? []), { codes }]
+          // 前端现在传「市场前缀 + 代码」或 thscode（sh600519 / 600519.SH），
+          // 匹配时统一抽 6 位数字，避免裸 code 比对失败。
           out = codes
-            .map((c) => DEMO_STOCKS.find((s) => s.code === c))
+            .map((c) => {
+              const digits = c.replace(/[^0-9]/g, '').slice(0, 6)
+              return DEMO_STOCKS.find((s) => s.code === digits)
+            })
             .filter((s): s is DemoStock => s !== undefined)
             .map(quoteOf)
           break
@@ -1460,8 +1712,14 @@ export function createMockBridge(): GoBridge {
     },
     Invoke: async (plugin: string, method: string, payload: string) => {
       const p = JSON.parse(payload || '{}') as Record<string, unknown>
+      const ext = await dispatchMock(plugin, method, p)
+      if (ext.hit) return ext.value === undefined ? '' : JSON.stringify(ext.value)
       let out: unknown
-      if (plugin === 'watchlist') {
+      if (plugin === 'fuyao') {
+        // 先走 mocks/registry（已命中时不会到这里）；此分支是纯兜底，
+        // 保证即使注册晚于首次调用也能拿到演示数据。
+        out = fuyaoMock(method, p)
+      } else if (plugin === 'watchlist') {
         if (method === 'list') out = watchPayload()
         else if (method === 'sync') out = syncResult()
         else if (method === 'groups') out = { groups: ['核心持仓', '观察池', '指数'] }
@@ -1509,10 +1767,16 @@ export function createMockBridge(): GoBridge {
             hasKey: p.apiKey ? true : idx >= 0 ? models[idx]?.hasKey === true : false,
             isDefault: setDefault || (idx >= 0 ? models[idx]?.isDefault === true : false),
             maxTokens: typeof p.maxTokens === 'number' ? p.maxTokens : undefined,
+            contextWindow: typeof p.contextWindow === 'number' ? p.contextWindow : idx >= 0 ? models[idx]?.contextWindow : undefined,
           }
           if (idx >= 0) models[idx] = next
           else models.push(next)
           out = { providers: models, defaultId: models.find((m) => m.isDefault)?.id ?? '' }
+        } else if (method === 'setDefault') {
+          const id = String(p.id ?? '')
+          if (!models.some((m) => m.id === id)) throw new Error('模型配置不存在：' + id)
+          models.forEach((m) => (m.isDefault = m.id === id))
+          out = { providers: models, defaultId: id }
         } else if (method === 'test') {
           await sleep(640)
           out = { ok: true, latencyMs: 612, message: '连通正常，模型返回 1 个 token' }
